@@ -811,3 +811,36 @@ int pca_prune_maybe_run_and_report(void) {
     last_run_ms = now_ms;
     return 1;
 }
+
+
+
+
+
+
+#include "debug_print.h"
+#include <stdio.h>
+#include "usart.h" /* provides extern UART_HandleTypeDef huart3 */
+
+void debug_print_init(void) {
+    /* nothing for now; kept for future use */
+}
+
+/* route printf to huart3 */
+#ifdef __GNUC__
+int __io_putchar(int ch) {
+#else
+int fputc(int ch, FILE *f) {
+#endif
+    uint8_t c = (uint8_t)ch;
+    HAL_UART_Transmit(&huart3, &c, 1, HAL_MAX_DELAY);
+    return ch;
+}
+
+void print_hex_buf(const uint8_t *buf, unsigned len) {
+    for (unsigned i = 0; i < len; ++i) {
+        printf("%02X ", (unsigned)buf[i]);
+        if ((i & 15) == 15) printf("\r\n");
+    }
+    printf("\r\n");
+}
+
