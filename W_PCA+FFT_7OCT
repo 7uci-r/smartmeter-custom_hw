@@ -1,0 +1,929 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : THDC parser + PCA pruning integration + RTC diagnostics
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+#include "main.h"
+#include "dma.h"
+#include "usart.h"
+#include "usb_otg.h"
+#include "gpio.h"
+#include "fft_utils.h"
+
+
+#include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <stdint.h>
+
+#include "pca_prune.h"  /* pca_prune_feed_sample(), pca_prune_maybe_run_and_report() */
+
+#define HAVE_PCA_PRUNE 1
+
+/* THDC frame constants */
+#define FRAME_TOTAL_LEN   46
+#define FRAME_PAYLOAD_LEN 39
+#define FRAME_HEADER0 'T'
+#define FRAME_HEADER1 'H'
+#define FRAME_HEADER2 'D'
+#define FRAME_HEADER3 'C'
+
+#ifndef RX_DMA_BUF_LEN
+#define RX_DMA_BUF_LEN 128
+#endif
+
+/* extern DMA rx buffer (from usart.c) */
+extern volatile uint8_t rx_dma_buf[RX_DMA_BUF_LEN];
+
+/* parser state variables */
+static uint8_t frame_buf[FRAME_TOTAL_LEN];
+static size_t frame_idx = 0;
+static int parser_state = 0;
+static uint16_t dma_last_pos = 0;
+
+/* parsed measurement variables */
+static volatile float parsed_voltage = 0.0f;
+static volatile float parsed_current = 0.0f;
+static volatile float parsed_frequency = 0.0f;
+static volatile float parsed_apparent = 0.0f;
+static volatile float parsed_active = 0.0f;
+static volatile float parsed_pf = 0.0f;
+static volatile char  parsed_pfSign = ' ';
+
+/* parsed timestamp from frame */
+static volatile uint8_t parsed_day = 0;
+static volatile uint8_t parsed_month = 0;
+static volatile uint8_t parsed_year_off = 0;
+static volatile uint8_t parsed_hour = 0;
+static volatile uint8_t parsed_minute = 0;
+static volatile uint8_t parsed_second = 0;
+
+/* flags */
+static volatile uint8_t frame_ready_flag = 0;
+
+/* simple UART3 debug printf */
+static void dbg_print(const char *fmt, ...)
+{
+    char tmp[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        uint16_t len = (uint16_t)((n < (int)sizeof(tmp)) ? n : (int)sizeof(tmp)-1);
+        HAL_UART_Transmit(&huart3, (uint8_t *)tmp, len, HAL_MAX_DELAY);
+    }
+}
+
+/* CRC helper */
+static uint16_t crc16_modbus(const uint8_t *data, uint16_t len)
+{
+    uint16_t crc = 0xFFFF;
+    for (uint16_t pos = 0; pos < len; pos++) {
+        crc ^= data[pos];
+        for (uint8_t i = 0; i < 8; i++) {
+            if (crc & 0x0001) crc = (crc >> 1) ^ 0xA001;
+            else crc >>= 1;
+        }
+    }
+    return crc;
+}
+
+/* big-endian helpers */
+static uint32_t read_u32_be(const uint8_t *p) { return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
+static uint16_t read_u16_be(const uint8_t *p) { return (uint16_t)((p[0]<<8)|p[1]); }
+
+/* parser */
+static void parser_feed_byte(uint8_t b)
+{
+    switch (parser_state) {
+    case 0:
+        if (b == FRAME_HEADER0) { frame_buf[0] = b; frame_idx = 1; parser_state = 1; }
+        break;
+    case 1:
+        if (frame_idx == 1 && b == FRAME_HEADER1) { frame_buf[frame_idx++] = b; parser_state = 2; }
+        else { parser_state = (b == FRAME_HEADER0) ? 1 : 0; frame_idx = (parser_state)?1:0; }
+        break;
+    case 2:
+        if (b == FRAME_HEADER2) { frame_buf[frame_idx++] = b; parser_state = 3; }
+        else { parser_state = (b == FRAME_HEADER0)?1:0; frame_idx = (parser_state)?1:0; }
+        break;
+    case 3:
+        if (b == FRAME_HEADER3) { frame_buf[frame_idx++] = b; parser_state = 4; }
+        else { parser_state = (b == FRAME_HEADER0)?1:0; frame_idx = (parser_state)?1:0; }
+        break;
+    case 4:
+        frame_buf[frame_idx++] = b;
+        if (b != FRAME_PAYLOAD_LEN) { parser_state = 0; frame_idx = 0; }
+        else parser_state = 5;
+        break;
+    case 5:
+        frame_buf[frame_idx++] = b;
+        if (frame_idx >= FRAME_TOTAL_LEN) {
+            uint16_t crc_calc = crc16_modbus(&frame_buf[5], FRAME_PAYLOAD_LEN);
+            uint16_t crc_rx = ((uint16_t)frame_buf[44] << 8) | frame_buf[45];
+            if (crc_calc == crc_rx) {
+                const uint8_t *pl = &frame_buf[5];
+                uint32_t voltage_mV    = read_u32_be(&pl[0]);
+                uint32_t current_mA    = read_u32_be(&pl[4]);
+                uint32_t realPower_w   = read_u32_be(&pl[8]);
+                uint32_t apparentPower = read_u32_be(&pl[16]);
+                uint16_t instPF_raw    = read_u16_be(&pl[20]);
+                char pfSign            = (char)pl[22];
+                uint16_t freq_raw      = read_u16_be(&pl[23]);
+                uint8_t day            = pl[33];
+                uint8_t month          = pl[34];
+                uint8_t year_off       = pl[35];
+                uint8_t hour           = pl[36];
+                uint8_t minute         = pl[37];
+                uint8_t second         = pl[38];
+
+                parsed_voltage   = ((float)voltage_mV)/1000.0f;
+                parsed_current   = ((float)current_mA)/1000.0f;
+                parsed_active    = (float)realPower_w;
+                parsed_apparent  = (float)apparentPower;
+                parsed_pf        = ((float)instPF_raw)/100.0f;
+                parsed_pfSign    = pfSign;
+                parsed_frequency = ((float)freq_raw)/100.0f;
+
+                parsed_day       = day;
+                parsed_month     = month;
+                parsed_year_off  = year_off;
+                parsed_hour      = hour;
+                parsed_minute    = minute;
+                parsed_second    = second;
+
+                frame_ready_flag = 1;
+            }
+            parser_state = 0; frame_idx = 0;
+        }
+        break;
+    default: parser_state = 0; frame_idx = 0; break;
+    }
+}
+
+/* poll DMA ring buffer */
+static void parser_poll_dma(void)
+{
+    if (huart2.hdmarx == NULL) return;
+    uint16_t new_pos = (uint16_t)(RX_DMA_BUF_LEN - __HAL_DMA_GET_COUNTER(huart2.hdmarx));
+    if (new_pos != dma_last_pos) {
+        if (new_pos > dma_last_pos)
+            for (uint16_t i = dma_last_pos; i < new_pos; ++i) parser_feed_byte(rx_dma_buf[i]);
+        else {
+            for (uint16_t i = dma_last_pos; i < RX_DMA_BUF_LEN; ++i) parser_feed_byte(rx_dma_buf[i]);
+            for (uint16_t i = 0; i < new_pos; ++i) parser_feed_byte(rx_dma_buf[i]);
+        }
+        dma_last_pos = new_pos;
+    }
+}
+
+/* main */
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_DMA_Init();
+    MX_USART3_UART_Init(); /* debug */
+    MX_USB_OTG_FS_PCD_Init();
+    MX_USART2_UART_Init(); /* meter UART */
+
+    dbg_print("\r\n[BOOT] THDC + PCA + RTC print active\r\n");
+
+#ifdef HAVE_PCA_PRUNE
+    pca_prune_init();
+#endif
+
+    HAL_UART_Receive_DMA(&huart2, (uint8_t*)rx_dma_buf, RX_DMA_BUF_LEN);
+    dma_last_pos = (uint16_t)(RX_DMA_BUF_LEN - __HAL_DMA_GET_COUNTER(huart2.hdmarx));
+
+    dbg_print("DMA RX started (%u bytes)\r\n", RX_DMA_BUF_LEN);
+
+    uint32_t last_rtc_print_ms = 0;
+
+    while (1) {
+        parser_poll_dma();
+
+        /* Print RTC time every second regardless of frame parsing */
+        uint32_t now = HAL_GetTick();
+        if (now - last_rtc_print_ms >= 1000) {
+            last_rtc_print_ms = now;
+            dbg_print("[RTC] %02u-%02u-20%02u %02u:%02u:%02u\r\n",
+                      parsed_day, parsed_month, parsed_year_off,
+                      parsed_hour, parsed_minute, parsed_second);
+        }
+
+        if (frame_ready_flag) {
+            frame_ready_flag = 0;
+
+            float voltage  = parsed_voltage * 10.0f;
+            float current  = parsed_current;
+            float freq     = parsed_frequency * 10.0f;
+            float apparent = parsed_apparent;
+            float active   = parsed_active;
+            float pf       = parsed_pf;
+            char pfSign    = parsed_pfSign;
+
+            dbg_print("[DATA] %02u-%02u-20%02u %02u:%02u:%02u | "
+                      "V=%.2f I=%.3f P=%.1f PF=%c%.2f F=%.2f\r\n",
+                      parsed_day, parsed_month, parsed_year_off,
+                      parsed_hour, parsed_minute, parsed_second,
+                      voltage, current, active, pfSign, pf, freq);
+
+#if N_VARS >= 6
+            float sample[N_VARS] = { current, voltage, active, apparent, pf, freq };
+#else
+            float sample[6] = { current, voltage, active, apparent, pf, freq };
+#endif
+
+#ifdef HAVE_PCA_PRUNE
+            pca_prune_feed_sample(sample);
+            pca_prune_maybe_run_and_report();
+#endif
+        }
+        HAL_Delay(1);
+    }
+}
+
+/* clock config (use your working version) */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 384;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLQ = 8;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK|
+                                RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3);
+}
+
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1) { }
+}
+
+
+
+#ifndef PCA_PRUNE_H
+#define PCA_PRUNE_H
+
+#include <stdint.h>
+
+/* Keep these consistent with your main project */
+#ifndef N_VARS
+#define N_VARS 6   /* current, voltage, active, apparent, pf, freq */
+#endif
+
+#ifndef BATCH_M
+#define BATCH_M 60
+#endif
+
+/* Public API - used by main.c */
+void pca_prune_init(void);
+void pca_prune_feed_sample(const float sample[N_VARS]);
+
+/* Run pruning when enough samples accumulated. If run, it prints report via dbg_print()
+   and resets the internal batch. Returns 1 if run, 0 otherwise. */
+int pca_prune_maybe_run_and_report(void);
+
+#endif /* PCA_PRUNE_H */
+
+
+/*
+ * Core/Src/pca_prune.c
+ *
+ * PCA + pruning module (top-1 PCA) with verbose diagnostics and FFT-prune integration.
+ *
+ * Expects dbg_print(const char *fmt, ...) implemented in main.c
+ */
+
+#include "pca_prune.h"
+#include "fft_utils.h"
+#include <string.h>
+#include <stdio.h>
+#include <math.h>
+#include "usart.h"
+extern UART_HandleTypeDef huart3;
+
+#include <stdarg.h>
+
+void dbg_print(const char *fmt, ...) {
+    char buf[256];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    HAL_UART_Transmit(&huart3, (uint8_t*)buf, strlen(buf), HAL_MAX_DELAY);
+}
+
+/* Expect dbg_print implemented in main.c (blocking via huart3) */
+extern void dbg_print(const char *fmt, ...);
+
+/* Internal storage */
+static float data_buf[BATCH_M][N_VARS];
+static int sample_count = 0;
+
+/* helpers */
+static void zero_buf(void) {
+    memset(data_buf, 0, sizeof(data_buf));
+    sample_count = 0;
+}
+
+/* init */
+void pca_prune_init(void) {
+    zero_buf();
+    dbg_print("[PCA] pca_prune_init: BATCH_M=%d N_VARS=%d\r\n", BATCH_M, N_VARS);
+}
+
+/* copy a sample (N_VARS floats) into internal buffer.
+   Diagnostic print added so we can confirm feed operations. */
+void pca_prune_feed_sample(const float sample[N_VARS]) {
+    if (sample == NULL) return;
+    if (sample_count < BATCH_M) {
+        for (int j = 0; j < N_VARS; ++j) data_buf[sample_count][j] = sample[j];
+        sample_count++;
+        dbg_print("[PCA] fed sample #%d: [", sample_count);
+        for (int j = 0; j < N_VARS; ++j) dbg_print("%.3f%s", sample[j], (j+1==N_VARS) ? "" : ", ");
+        dbg_print("]\r\n");
+    } else {
+        /* rolling: drop oldest */
+        memmove(&data_buf[0], &data_buf[1], sizeof(float) * N_VARS * (BATCH_M - 1));
+        for (int j = 0; j < N_VARS; ++j) data_buf[BATCH_M - 1][j] = sample[j];
+        dbg_print("[PCA] buffer full -> rolling, still count=%d\r\n", sample_count);
+    }
+}
+
+/* compute column means */
+static void compute_means(float means[N_VARS]) {
+    for (int j = 0; j < N_VARS; ++j) means[j] = 0.0f;
+    if (sample_count <= 0) return;
+    for (int i = 0; i < sample_count; ++i)
+        for (int j = 0; j < N_VARS; ++j)
+            means[j] += data_buf[i][j];
+    float inv = 1.0f / (float)sample_count;
+    for (int j = 0; j < N_VARS; ++j) means[j] *= inv;
+}
+
+/* compute unbiased covariance matrix (N_VARS x N_VARS) */
+static void compute_covariance(const float means[N_VARS], float cov[N_VARS][N_VARS]) {
+    for (int i = 0; i < N_VARS; ++i)
+        for (int j = 0; j < N_VARS; ++j)
+            cov[i][j] = 0.0f;
+    if (sample_count < 2) return;
+    for (int t = 0; t < sample_count; ++t) {
+        for (int i = 0; i < N_VARS; ++i) {
+            float a = data_buf[t][i] - means[i];
+            for (int j = 0; j < N_VARS; ++j) {
+                float b = data_buf[t][j] - means[j];
+                cov[i][j] += a * b;
+            }
+        }
+    }
+    float denom = 1.0f / (float)(sample_count - 1);
+    for (int i = 0; i < N_VARS; ++i)
+        for (int j = 0; j < N_VARS; ++j)
+            cov[i][j] *= denom;
+}
+
+/* power iteration (top-1 eigenvector) */
+static void power_iteration_top1(const float cov[N_VARS][N_VARS], float eig[N_VARS]) {
+    /* initialize */
+    for (int i = 0; i < N_VARS; ++i) eig[i] = 1.0f; /* simple seed */
+    /* normalize seed */
+    {
+        float s = 0.0f;
+        for (int i = 0; i < N_VARS; ++i) s += eig[i]*eig[i];
+        s = sqrtf(s); if (s <= 1e-12f) s = 1.0f;
+        for (int i = 0; i < N_VARS; ++i) eig[i] /= s;
+    }
+    /* iterate */
+    for (int it = 0; it < 100; ++it) {
+        float y[N_VARS];
+        for (int i = 0; i < N_VARS; ++i) { y[i] = 0.0f; for (int j = 0; j < N_VARS; ++j) y[i] += cov[i][j] * eig[j]; }
+        /* norm */
+        float norm = 0.0f;
+        for (int i = 0; i < N_VARS; ++i) norm += y[i]*y[i];
+        if (norm <= 1e-20f) break;
+        norm = sqrtf(norm);
+        /* compute difference to check convergence */
+        float diff = 0.0f;
+        for (int i = 0; i < N_VARS; ++i) {
+            float v = y[i]/norm;
+            float d = v - eig[i];
+            diff += d*d;
+            eig[i] = v;
+        }
+        if (diff < 1e-12f) break;
+    }
+}
+
+/* project to top-1 component to get scores */
+static void project_scores(const float means[N_VARS], const float eig[N_VARS], float scores[BATCH_M]) {
+    for (int t = 0; t < sample_count; ++t) {
+        float s = 0.0f;
+        for (int j = 0; j < N_VARS; ++j) s += (data_buf[t][j] - means[j]) * eig[j];
+        scores[t] = s;
+    }
+}
+
+/* reconstruct from scores */
+static void reconstruct_from_scores(const float means[N_VARS], const float eig[N_VARS], const float scores[BATCH_M], float recon[BATCH_M][N_VARS]) {
+    for (int t = 0; t < sample_count; ++t)
+        for (int j = 0; j < N_VARS; ++j)
+            recon[t][j] = means[j] + scores[t] * eig[j];
+}
+
+/* compute MSE between data_buf and recon */
+static float compute_mse_internal(const float recon[BATCH_M][N_VARS]) {
+    double sse = 0.0;
+    for (int t = 0; t < sample_count; ++t)
+        for (int j = 0; j < N_VARS; ++j) {
+            double d = (double)data_buf[t][j] - (double)recon[t][j];
+            sse += d * d;
+        }
+    double denom = (double)sample_count * (double)N_VARS;
+    if (denom <= 0.0) return 0.0f;
+    return (float)(sse / denom);
+}
+
+/* compute total variance of original data (used to estimate savings) */
+static float compute_total_variance(const float means[N_VARS]) {
+    double s = 0.0;
+    for (int t = 0; t < sample_count; ++t)
+        for (int j = 0; j < N_VARS; ++j) {
+            double d = (double)data_buf[t][j] - (double)means[j];
+            s += d*d;
+        }
+    double denom = (double)sample_count * (double)N_VARS;
+    if (denom <= 0.0) return 0.0f;
+    return (float)(s / denom);
+}
+
+/* The main public function: if enough samples accumulated, run PCA, print report, reset buffer.
+   Adds diagnostics for sample_count and time-based trigger. */
+int pca_prune_maybe_run_and_report(void) {
+    static uint32_t last_run_ms = 0;
+    uint32_t now_ms = HAL_GetTick();
+
+    dbg_print("[PCA] maybe_run called: sample_count=%d last_run=%lu now=%lu elapsed=%lu\r\n",
+              sample_count, (unsigned long)last_run_ms, (unsigned long)now_ms, (unsigned long)(now_ms - last_run_ms));
+
+    /* Trigger if buffer is full OR 60s passed since last run and we have at least some samples */
+    if (sample_count < BATCH_M && (now_ms - last_run_ms) < 60000UL) {
+        dbg_print("[PCA] Not running: sample_count=%d elapsed=%lums (need %d or 60000ms)\r\n",
+                  sample_count, (unsigned long)(now_ms - last_run_ms), BATCH_M);
+        return 0;
+    }
+    if (sample_count < 4) {
+        dbg_print("[PCA] Not enough samples to run PCA (have %d)\r\n", sample_count);
+        return 0;
+    }
+
+    dbg_print("[PCA] Running PCA with %d samples (forced by timer/full)\r\n", sample_count);
+
+    /* 1) Means */
+    float means[N_VARS];
+    compute_means(means);
+
+    /* 2) Covariance */
+    float cov[N_VARS][N_VARS];
+    compute_covariance(means, cov);
+
+    /* 3) Top-1 eigvec */
+    float eigvec[N_VARS];
+    power_iteration_top1(cov, eigvec);
+
+    /* 4) Project -> scores */
+    float scores[BATCH_M];
+    project_scores(means, eigvec, scores);
+
+    /* 5) Reconstruct & MSE */
+    float recon[BATCH_M][N_VARS];
+    reconstruct_from_scores(means, eigvec, scores, recon);
+    float mse = compute_mse_internal(recon);
+
+    /* 6) total variance and savings estimate */
+    float tot_var = compute_total_variance(means);
+    float savings_pct = 0.0f;
+    if (tot_var > 1e-12f) savings_pct = (1.0f - (mse / tot_var)) * 100.0f;
+    if (savings_pct < 0.0f) savings_pct = 0.0f;
+
+    /* 7) Print detailed PCA report */
+    dbg_print("\r\n=== PCA PRUNE REPORT ===\r\n");
+    dbg_print("Samples: %d  N_VARS: %d  BATCH_M: %d\r\n", sample_count, N_VARS, BATCH_M);
+
+    // Eigenvector (direction of maximum variance)
+    dbg_print("eigvec: ");
+    for (int j = 0; j < N_VARS; ++j) dbg_print("%.4f ", eigvec[j]);
+    dbg_print("\r\n");
+
+    // Means (centroid)
+    dbg_print("means:  ");
+    for (int j = 0; j < N_VARS; ++j) dbg_print("%.3f ", means[j]);
+    dbg_print("\r\n");
+
+    // Core metrics
+    dbg_print("MSE=%.6f  TotVar=%.6f  EstimatedSavings=%.2f%%\r\n",
+              mse, tot_var, savings_pct);
+
+    // --- Additional breakdown ---
+    // variance captured ratio (explained variance)
+    float explained_ratio = 0.0f;
+    if (tot_var > 1e-9f) explained_ratio = 100.0f * (1.0f - mse / tot_var);
+
+    // Raw data size vs projected data size (approx)
+    const int raw_bytes = sample_count * N_VARS * sizeof(float);
+    const int pca_bytes = sample_count * sizeof(float); // top-1 projection (scores)
+    float pca_savings = 100.0f * (1.0f - ((float)pca_bytes / (float)raw_bytes));
+
+    dbg_print("\r\n--- PCA Compression Estimates ---\r\n");
+    dbg_print("RawBytes=%d  PCA_1D_Bytes=%d  Savings=%.2f%%  ExplainedVar=%.2f%%\r\n",
+              raw_bytes, pca_bytes, pca_savings, explained_ratio);
+
+    // Per-variable reconstruction errors (RMS)
+    dbg_print("\r\nPer-variable RMS reconstruction errors:\r\n");
+    for (int j = 0; j < N_VARS; ++j) {
+        double se = 0.0;
+        for (int t = 0; t < sample_count; ++t) {
+            double d = (double)data_buf[t][j] - (double)recon[t][j];
+            se += d * d;
+        }
+        float rms = 0.0f;
+        if (sample_count > 0) rms = sqrtf(se / sample_count);
+        dbg_print("Var[%d]: RMS=%.6f  mean=%.3f\r\n", j, rms, means[j]);
+    }
+
+    // Top projection min/max range (for quantization preview)
+    float smin = scores[0], smax = scores[0];
+    for (int t = 1; t < sample_count; ++t) {
+        if (scores[t] < smin) smin = scores[t];
+        if (scores[t] > smax) smax = scores[t];
+    }
+    dbg_print("\r\nScores range: min=%.3f  max=%.3f  span=%.3f\r\n", smin, smax, smax - smin);
+
+    /* === FFT-based pruning of the top-1 scores (compressive sensing) === */
+    {
+        int16_t qre[MAX_KEEP_BINS];
+        int16_t qim[MAX_KEEP_BINS];
+        int kept_idx[MAX_KEEP_BINS];
+        int kept_n = 0;
+        int qbytes = 0;
+        float recon_mse = 0.0f;
+
+        int rc = fft_prune(scores, sample_count,
+                           qre, qim, kept_idx, &kept_n,
+                           &qbytes, &recon_mse);
+        if (rc == 0) {
+            dbg_print("\r\n--- FFT PRUNE (scores) ---\r\n");
+            dbg_print("Kept bins: %d  QuantBytes=%d  ReconMSE=%.6f\r\n", kept_n, qbytes, recon_mse);
+            dbg_print("Indices: ");
+            for (int i = 0; i < kept_n; ++i) dbg_print("%d ", kept_idx[i]);
+            dbg_print("\r\nQuantized (re,im): ");
+            for (int i = 0; i < kept_n; ++i) dbg_print("%d,%d ", (int)qre[i], (int)qim[i]);
+            dbg_print("\r\n");
+
+            /* realistic compressed bytes accounting (means + eigvec as float32 + quantized bins payload) */
+            int bytes_means = N_VARS * 4;
+            int bytes_eigvec = N_VARS * 4;
+            int total_bytes = bytes_means + bytes_eigvec + qbytes;
+            float real_saved = 100.0f * (1.0f - ((float)total_bytes / (float)raw_bytes));
+            dbg_print("Bytes: raw=%d compressed(est)=%d saved=%.2f%%\r\n", raw_bytes, total_bytes, real_saved);
+        } else {
+            dbg_print("[PCA] fft_prune failed rc=%d\r\n", rc);
+        }
+    }
+
+    /* Compact summary line for quick logs */
+    dbg_print("\r\n[PCA_SUMMARY] MSE=%.6f | TotVar=%.6f | Explained=%.2f%% | BytesSaved=%.2f%%\r\n",
+              mse, tot_var, explained_ratio, pca_savings);
+    dbg_print("========================\r\n");
+
+    /* Reset batch */
+    zero_buf();
+    last_run_ms = now_ms;
+    return 1;
+}
+
+
+#ifndef FFT_UTILS_H
+#define FFT_UTILS_H
+
+#include "arm_math.h"   // CMSIS DSP
+#include <stdint.h>
+
+/* -------------------------------------------------------------------
+ *  FFT configuration parameters
+ * ------------------------------------------------------------------- */
+#define FFT_LEN           64
+#define MAX_KEEP_BINS     8
+#define ENERGY_THRESHOLD  0.90f
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * @brief Perform FFT-based pruning / compression of PCA scores.
+ *
+ * @param scores: Input float array (time-domain signal or PCA scores)
+ * @param len: Length of the input (≤ FFT_LEN)
+ * @param qre_out: Quantized real bins output (int16_t)
+ * @param qim_out: Quantized imaginary bins output (int16_t)
+ * @param kept_bins: Array of indices of kept bins
+ * @param n_kept: Number of bins actually kept
+ * @param total_bins: Total bins considered
+ * @param energy_kept: Fraction of total energy preserved (0–1)
+ *
+ * @return int 0 = OK, negative on error
+ */
+int fft_prune(const float *scores, int len,
+              int16_t *qre_out, int16_t *qim_out,
+              int *kept_bins, int *n_kept,
+              int *total_bins, float *energy_kept);
+
+/**
+ * @brief Run full FFT compression + quantization + inverse reconstruction.
+ */
+void run_fft_compress(float *input, int len);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* FFT_UTILS_H */
+
+
+//#ifndef FFT_UTILS_H__
+//#define FFT_UTILS_H__
+//
+//#include <stdint.h>
+//
+///*
+// * fft_prune
+// *
+// * Inputs:
+// *   scores[len]         - real-valued principal component scores (len = sample_count)
+// *   len                 - number of valid samples (<= BATCH_M)
+// *
+// * Outputs:
+// *   kept_bins[out_n]    - indices of kept frequency bins (0..FFT_LEN-1)
+// *   out_n               - pointer to int, number of kept bins returned
+// *   out_qre[out_n]      - quantized real parts (int16) for each kept bin
+// *   out_qim[out_n]      - quantized imag parts (int16) for each kept bin
+// *   out_qbytes          - pointer to int, number of bytes required to store quantized bins (filled)
+// *   out_recon_mse       - pointer to float, MSE between reconstructed PC (first len samples) and original scores
+// *
+// * Returns 0 on success, <0 on failure.
+// *
+// * Notes:
+// *  - Implementation currently uses an O(N^2) direct DFT for portability.
+// *  - FFT_LEN is fixed to 64 (power-of-two >= typical BATCH_M=60). You may change FFT_LEN if needed.
+// */
+//int fft_prune(const float *scores, int len,
+//              int16_t *out_qre, int16_t *out_qim, int *kept_bins, int *out_n,
+//              int *out_qbytes, float *out_recon_mse);
+//
+//#endif /* FFT_UTILS_H__ */
+
+
+#include "fft_utils.h"
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include "main.h"   // contains N_VARS definition
+
+/* Tunable parameters */
+#ifndef FFT_LEN
+#define FFT_LEN 64           /* next power-of-two >= BATCH_M (60) */
+#endif
+#ifndef ENERGY_THRESHOLD
+#define ENERGY_THRESHOLD 0.90f
+#endif
+#ifndef MAX_KEEP_BINS
+#define MAX_KEEP_BINS 8
+#endif
+#define N_VARS 6
+
+/* Internal complex number helpers (float) */
+typedef struct { float re, im; } cplx;
+
+/* Simple DFT (forward): input real[] length N -> output complex[] length N */
+static void dft_forward_real(const float *real_in, int N, cplx *out)
+{
+    for (int k = 0; k < N; ++k) {
+        float acc_re = 0.0f;
+        float acc_im = 0.0f;
+        for (int n = 0; n < N; ++n) {
+            float angle = -2.0f * (float)M_PI * (float)k * (float)n / (float)N;
+            float cr = cosf(angle);
+            float ci = sinf(angle);
+            acc_re += real_in[n] * cr;
+            acc_im += real_in[n] * ci;
+        }
+        out[k].re = acc_re;
+        out[k].im = acc_im;
+    }
+}
+
+/* Inverse DFT from complex spectrum (length N) -> real_out (length N) */
+static void dft_inverse_real(const cplx *spec, int N, float *real_out)
+{
+    for (int n = 0; n < N; ++n) {
+        float acc = 0.0f;
+        for (int k = 0; k < N; ++k) {
+            float angle = 2.0f * (float)M_PI * (float)k * (float)n / (float)N;
+            acc += spec[k].re * cosf(angle) - spec[k].im * sinf(angle);
+        }
+        real_out[n] = acc / (float)N;
+    }
+}
+
+/* Helper: absolute-squared (energy) of complex number */
+static inline float cplx_energy(const cplx *c) { return c->re * c->re + c->im * c->im; }
+
+/* Simple selection of top bins by energy (returns indices in descending order) */
+static void select_top_bins(const float *energies, int N, int max_bins, int *out_idx, int *out_count, float energy_threshold)
+{
+    /* copy energies into a local array of (value, index) pairs */
+    typedef struct { float e; int idx; } pair;
+    pair *arr = (pair *)malloc(sizeof(pair) * N);
+    for (int i = 0; i < N; ++i) { arr[i].e = energies[i]; arr[i].idx = i; }
+
+    /* sort descending by energy (simple selection sort since N small) */
+    for (int i = 0; i < N - 1; ++i) {
+        int m = i;
+        for (int j = i + 1; j < N; ++j) if (arr[j].e > arr[m].e) m = j;
+        if (m != i) { pair tmp = arr[i]; arr[i] = arr[m]; arr[m] = tmp; }
+    }
+
+    /* choose bins until energy threshold met or max_bins reached */
+    float total = 0.0f;
+    for (int i = 0; i < N; ++i) total += arr[i].e;
+    float cum = 0.0f;
+    int chosen = 0;
+    for (int i = 0; i < N && chosen < max_bins; ++i) {
+        cum += arr[i].e;
+        out_idx[chosen++] = arr[i].idx;
+        if (total > 0.0f && (cum / total) >= energy_threshold) break;
+    }
+    *out_count = chosen;
+    free(arr);
+}
+
+/* Quantize kept bins (real+imag) to int16 using symmetric scaling */
+static int quantize_bins(const cplx *spec, const int *bins, int nbins, int16_t *out_qre, int16_t *out_qim, float *scale_out)
+{
+    float max_abs = 0.0f;
+    for (int i = 0; i < nbins; ++i) {
+        int idx = bins[i];
+        float a = fabsf(spec[idx].re);
+        float b = fabsf(spec[idx].im);
+        if (a > max_abs) max_abs = a;
+        if (b > max_abs) max_abs = b;
+    }
+    if (max_abs < 1e-9f) max_abs = 1.0f; /* avoid div by zero */
+
+    /* scale so that max_abs maps to int16 max */
+    float scale = max_abs / 32767.0f;
+    for (int i = 0; i < nbins; ++i) {
+        int idx = bins[i];
+        int32_t qre = (int32_t)roundf(spec[idx].re / scale);
+        int32_t qim = (int32_t)roundf(spec[idx].im / scale);
+        if (qre > 32767) qre = 32767; if (qre < -32768) qre = -32768;
+        if (qim > 32767) qim = 32767; if (qim < -32768) qim = -32768;
+        out_qre[i] = (int16_t)qre;
+        out_qim[i] = (int16_t)qim;
+    }
+    if (scale_out) *scale_out = scale;
+    return 0;
+}
+
+/* Unquantize bins into complex spectrum copy (spec_out) using scale */
+static void unquantize_bins_into_spec(cplx *spec_out, const int *bins, int nbins, const int16_t *qre, const int16_t *qim, float scale)
+{
+    /* ensure spec_out is zeroed by caller */
+    for (int i = 0; i < nbins; ++i) {
+        int idx = bins[i];
+        spec_out[idx].re = ((float)qre[i]) * scale;
+        spec_out[idx].im = ((float)qim[i]) * scale;
+    }
+}
+
+/* Public function */
+int fft_prune(const float *scores, int len,
+              int16_t *out_qre, int16_t *out_qim, int *kept_bins, int *out_n,
+              int *out_qbytes, float *out_recon_mse)
+{
+    if (!scores || !kept_bins || !out_n || !out_qbytes || !out_recon_mse) return -1;
+    if (len <= 0 || len > FFT_LEN) return -2;
+
+    /* build real input of length FFT_LEN (zero padded) */
+    float real_in[FFT_LEN];
+    for (int i = 0; i < FFT_LEN; ++i) real_in[i] = 0.0f;
+    for (int i = 0; i < len; ++i) real_in[i] = scores[i];
+
+    /* forward DFT -> spec[0..FFT_LEN-1] */
+    cplx spec[FFT_LEN];
+    dft_forward_real(real_in, FFT_LEN, spec);
+
+    /* compute energies */
+    float energies[FFT_LEN];
+    float total_energy = 0.0f;
+    for (int k = 0; k < FFT_LEN; ++k) {
+        energies[k] = cplx_energy(&spec[k]);
+        total_energy += energies[k];
+    }
+
+    /* select top bins */
+    int sel_idx[FFT_LEN];
+    int sel_count = 0;
+    select_top_bins(energies, FFT_LEN, MAX_KEEP_BINS, sel_idx, &sel_count, ENERGY_THRESHOLD);
+
+    /* ensure conjugate pairs included for real signal (keep k and N-k) */
+    /* Build a small unique set including conjugates */
+    int uniq[FFT_LEN];
+    int uniq_count = 0;
+    for (int i = 0; i < sel_count; ++i) {
+        int k = sel_idx[i];
+        /* include k */
+        int found = 0;
+        for (int t = 0; t < uniq_count; ++t) if (uniq[t] == k) { found = 1; break; }
+        if (!found) uniq[uniq_count++] = k;
+        /* include conjugate N-k (if not equal and not already present) */
+        int kc = (k == 0) ? 0 : (FFT_LEN - k);
+        if (kc != k) {
+            found = 0;
+            for (int t = 0; t < uniq_count; ++t) if (uniq[t] == kc) { found = 1; break; }
+            if (!found) uniq[uniq_count++] = kc;
+        }
+    }
+
+    /* limit uniq_count to MAX_KEEP_BINS (if exceeded, truncate) */
+    if (uniq_count > MAX_KEEP_BINS) uniq_count = MAX_KEEP_BINS;
+
+    /* sort uniq ascending (for consistent printing) */
+    for (int i = 0; i < uniq_count - 1; ++i) {
+        int m = i;
+        for (int j = i + 1; j < uniq_count; ++j) if (uniq[j] < uniq[m]) m = j;
+        if (m != i) { int t = uniq[i]; uniq[i] = uniq[m]; uniq[m] = t; }
+    }
+
+    /* quantize selected bins */
+    float scale = 1.0f;
+    quantize_bins(spec, uniq, uniq_count, out_qre, out_qim, &scale);
+
+    /* compute quantized bytes: for each kept bin we store index (1 byte) + qre(2 bytes) + qim(2 bytes)
+       index size assumed 1 byte (enough for FFT_LEN=64). Adjust if larger. */
+    int bytes_for_bins = uniq_count * (1 + 2 + 2); /* idx + re + im */
+    int bytes_means = (N_VARS * 4); /* means as float32 */
+    int bytes_eigvec = (N_VARS * 4);
+    int total_bytes = bytes_means + bytes_eigvec + bytes_for_bins;
+
+    /* reconstruct spectrum from quantized bins */
+    cplx spec_pruned[FFT_LEN];
+    for (int i = 0; i < FFT_LEN; ++i) { spec_pruned[i].re = 0.0f; spec_pruned[i].im = 0.0f; }
+    unquantize_bins_into_spec(spec_pruned, uniq, uniq_count, out_qre, out_qim, scale);
+
+    /* inverse DFT to obtain reconstructed time-domain of length FFT_LEN */
+    float recon_full[FFT_LEN];
+    dft_inverse_real(spec_pruned, FFT_LEN, recon_full);
+
+    /* compute MSE between first 'len' samples of recon_full and original scores */
+    double sse = 0.0;
+    for (int i = 0; i < len; ++i) {
+        double d = (double)scores[i] - (double)recon_full[i];
+        sse += d * d;
+    }
+    double denom = (double)len;
+    float recon_mse = (denom > 0.0) ? (float)(sse / denom) : 0.0f;
+
+    /* copy uniq into kept_bins out (as int) and set out_n */
+    for (int i = 0; i < uniq_count; ++i) kept_bins[i] = uniq[i];
+    *out_n = uniq_count;
+    *out_qbytes = total_bytes;
+    *out_recon_mse = recon_mse;
+
+    return 0;
+}
