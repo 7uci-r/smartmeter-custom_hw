@@ -1,0 +1,1531 @@
+important files, w wifi without pcap 
+
+/* Core/Src/main.c - WiFi-enabled main (paste/merge into your project)
+   Assumes usart.c provides MX_UART5_Init() and global rx_dma_buf[].
+*/
+#include "main.h"
+#include "dma.h"
+#include "usart.h"
+#include "usb_otg.h"
+#include "gpio.h"
+#include "fft_utils.h"
+
+#include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <math.h>
+
+#include "pca_prune.h"
+#include "esp_comm.h"
+
+/* ====== PCAP TEST PAYLOAD (VALID FORMAT EXPECTED BY HES) ====== */
+/* 69-byte example with proper PCAP header + metadata */
+const uint8_t test_pcap_payload[] = {
+  0x50,0x43,0x41,0x50, /* "PCAP" */
+  0x04,0x00,           /* sample_count = 4 */
+  0x06,                /* n_vars = 6 */
+  /* means: 1,2,3,4,5,6 */
+  0x00,0x00,0x80,0x3F,
+  0x00,0x00,0x00,0x40,
+  0x00,0x00,0x40,0x40,
+  0x00,0x00,0x80,0x40,
+  0x00,0x00,0xA0,0x40,
+  0x00,0x00,0xC0,0x40,
+  /* eigvec 0,0,0,0,0,1 */
+  0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x00,
+  0x00,0x00,0x80,0x3F,
+  /* kept_n = 2 */
+  0x02,0x00,
+  /* kept_idx: 1,2 */
+  0x01,0x00, 0x02,0x00,
+  /* qre: 1000,2000 */
+  0xE8,0x03, 0xD0,0x07,
+  /* qim: -1000, -2000 */
+  0x18,0xFC, 0x30,0xF8
+};
+const uint16_t test_pcap_payload_len = sizeof(test_pcap_payload);
+
+#define HAVE_PCA_PRUNE 1
+
+#define FRAME_TOTAL_LEN   46
+#define FRAME_PAYLOAD_LEN 39
+#define FRAME_HEADER0 'T'
+#define FRAME_HEADER1 'H'
+#define FRAME_HEADER2 'D'
+#define FRAME_HEADER3 'C'
+
+#ifndef RX_DMA_BUF_LEN
+#define RX_DMA_BUF_LEN 128
+#endif
+
+extern volatile uint8_t rx_dma_buf[RX_DMA_BUF_LEN];
+
+/* forward prototype so calling before definition is fine */
+void SystemClock_Config(void);
+
+/* parser state and parsed vars (same as yours) */
+static uint8_t frame_buf[FRAME_TOTAL_LEN];
+static size_t frame_idx = 0;
+static int parser_state = 0;
+static uint16_t dma_last_pos = 0;
+
+static volatile float parsed_voltage = 0.0f;
+static volatile float parsed_current = 0.0f;
+static volatile float parsed_frequency = 0.0f;
+static volatile float parsed_apparent = 0.0f;
+static volatile float parsed_active = 0.0f;
+static volatile float parsed_pf = 0.0f;
+static volatile char  parsed_pfSign = ' ';
+
+static volatile uint8_t parsed_day = 0;
+static volatile uint8_t parsed_month = 0;
+static volatile uint8_t parsed_year_off = 0;
+static volatile uint8_t parsed_hour = 0;
+static volatile uint8_t parsed_minute = 0;
+static volatile uint8_t parsed_second = 0;
+
+static volatile uint8_t frame_ready_flag = 0;
+
+/* dbg_print on huart3 */
+void dbg_print(const char *fmt, ...)
+{
+    char tmp[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        uint16_t len = (uint16_t)((n < (int)sizeof(tmp)) ? n : (int)sizeof(tmp)-1);
+        HAL_UART_Transmit(&huart3, (uint8_t *)tmp, len, HAL_MAX_DELAY);
+    }
+}
+
+/* CRC helper and big-endian helpers */
+static uint16_t crc16_modbus(const uint8_t *data, uint16_t len)
+{ uint16_t crc = 0xFFFF; for (uint16_t pos = 0; pos < len; pos++) { crc ^= data[pos]; for (uint8_t i=0;i<8;i++){ if (crc & 1) crc = (crc>>1) ^ 0xA001; else crc >>= 1; } } return crc; }
+static uint32_t read_u32_be(const uint8_t *p) { return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
+static uint16_t read_u16_be(const uint8_t *p) { return (uint16_t)((p[0]<<8)|p[1]); }
+
+/* parser_feed_byte & parser_poll_dma (unchanged) */
+static void parser_feed_byte(uint8_t b)
+{
+    switch (parser_state) {
+    case 0:
+        if (b == FRAME_HEADER0) { frame_buf[0] = b; frame_idx = 1; parser_state = 1; }
+        break;
+    case 1:
+        if (frame_idx == 1 && b == FRAME_HEADER1) { frame_buf[frame_idx++] = b; parser_state = 2; }
+        else { parser_state = (b == FRAME_HEADER0) ? 1 : 0; frame_idx = (parser_state)?1:0; }
+        break;
+    case 2:
+        if (b == FRAME_HEADER2) { frame_buf[frame_idx++] = b; parser_state = 3; }
+        else { parser_state = (b == FRAME_HEADER0)?1:0; frame_idx = (parser_state)?1:0; }
+        break;
+    case 3:
+        if (b == FRAME_HEADER3) { frame_buf[frame_idx++] = b; parser_state = 4; }
+        else { parser_state = (b == FRAME_HEADER0)?1:0; frame_idx = (parser_state)?1:0; }
+        break;
+    case 4:
+        frame_buf[frame_idx++] = b;
+        if (b != FRAME_PAYLOAD_LEN) { parser_state = 0; frame_idx = 0; }
+        else parser_state = 5;
+        break;
+    case 5:
+        frame_buf[frame_idx++] = b;
+        if (frame_idx >= FRAME_TOTAL_LEN) {
+            uint16_t crc_calc = crc16_modbus(&frame_buf[5], FRAME_PAYLOAD_LEN);
+            uint16_t crc_rx = ((uint16_t)frame_buf[44] << 8) | frame_buf[45];
+            if (crc_calc == crc_rx) {
+                const uint8_t *pl = &frame_buf[5];
+                uint32_t voltage_mV    = read_u32_be(&pl[0]);
+                uint32_t current_mA    = read_u32_be(&pl[4]);
+                uint32_t realPower_w   = read_u32_be(&pl[8]);
+                uint32_t apparentPower = read_u32_be(&pl[16]);
+                uint16_t instPF_raw    = read_u16_be(&pl[20]);
+                char pfSign            = (char)pl[22];
+                uint16_t freq_raw      = read_u16_be(&pl[23]);
+                uint8_t day            = pl[33];
+                uint8_t month          = pl[34];
+                uint8_t year_off       = pl[35];
+                uint8_t hour           = pl[36];
+                uint8_t minute         = pl[37];
+                uint8_t second         = pl[38];
+
+                parsed_voltage   = ((float)voltage_mV)/1000.0f;
+                parsed_current   = ((float)current_mA)/1000.0f;
+                parsed_active    = (float)realPower_w;
+                parsed_apparent  = (float)apparentPower;
+                parsed_pf        = ((float)instPF_raw)/100.0f;
+                parsed_pfSign    = pfSign;
+                parsed_frequency = ((float)freq_raw)/100.0f;
+
+                parsed_day       = day;
+                parsed_month     = month;
+                parsed_year_off  = year_off;
+                parsed_hour      = hour;
+                parsed_minute    = minute;
+                parsed_second    = second;
+
+                frame_ready_flag = 1;
+            }
+            parser_state = 0; frame_idx = 0;
+        }
+        break;
+    default: parser_state = 0; frame_idx = 0; break;
+    }
+}
+
+static void parser_poll_dma(void)
+{
+    if (huart2.hdmarx == NULL) return;
+    uint16_t new_pos = (uint16_t)(RX_DMA_BUF_LEN - __HAL_DMA_GET_COUNTER(huart2.hdmarx));
+    if (new_pos != dma_last_pos) {
+        if (new_pos > dma_last_pos)
+            for (uint16_t i = dma_last_pos; i < new_pos; ++i) parser_feed_byte(rx_dma_buf[i]);
+        else {
+            for (uint16_t i = dma_last_pos; i < RX_DMA_BUF_LEN; ++i) parser_feed_byte(rx_dma_buf[i]);
+            for (uint16_t i = 0; i < new_pos; ++i) parser_feed_byte(rx_dma_buf[i]);
+        }
+        dma_last_pos = new_pos;
+    }
+}
+
+/* MAIN */
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_DMA_Init();
+
+    MX_USART3_UART_Init(); /* debug UART (huart3) */
+    /* Give USB-serial / UART a moment to appear on host */
+    HAL_Delay(120);
+    dbg_print("[DIAG] debug UART ready (huart3)\r\n");
+    dbg_print("[DIAG] Running ESP module check...\r\n");
+
+    MX_USB_OTG_FS_PCD_Init();
+    MX_USART2_UART_Init(); /* meter UART (huart2) */
+    MX_UART5_Init();       /* ESP UART (huart5) */
+
+    /* small pause to ensure ESP UART lines stable before first AT */
+    HAL_Delay(60);
+
+    esp_check_module(1000);
+
+    dbg_print("\r\n[BOOT] THDC + PCA + WiFi + RTC print active\r\n");
+
+#ifdef HAVE_PCA_PRUNE
+    pca_prune_init();
+#endif
+
+    /* start DMA for meter UART */
+    HAL_UART_Receive_DMA(&huart2, (uint8_t*)rx_dma_buf, RX_DMA_BUF_LEN);
+    dma_last_pos = (uint16_t)(RX_DMA_BUF_LEN - __HAL_DMA_GET_COUNTER(huart2.hdmarx));
+    dbg_print("DMA RX started (%u bytes)\r\n", RX_DMA_BUF_LEN);
+
+    uint32_t last_rtc_print_ms = 0;
+    bool wifi_ready = false;
+
+    const char *WIFI_SSID = "RM 1725";
+    const char *WIFI_PASS = "877,2f3W";
+    const char *HES_IP = "192.168.137.1";
+    const int   HES_PORT = 5050;
+
+    /* try join at boot */
+    if (esp_init_wifi_verbose(WIFI_SSID, WIFI_PASS, 10000)) {
+        dbg_print("[WIFI] joined SSID OK\r\n");
+        wifi_ready = true;
+        /* after wifi_ready = true */
+        HAL_Delay(1500); /* give AP/stack a moment to settle before CIPSTART */
+
+        /* immediate one-time PCAP test (if TCP opens) */
+        dbg_print("[TEST] Sending one-time PCAP payload to HES...\r\n");
+
+        if (esp_tcp_connect_verbose(HES_IP, HES_PORT, 8000)) {
+            bool ok = esp_tcp_send_verbose(test_pcap_payload, test_pcap_payload_len, 8000);
+            if (ok) dbg_print("[TEST] PCAP test payload sent OK (%u bytes)\r\n", test_pcap_payload_len);
+            else dbg_print("[TEST] PCAP test payload FAILED\r\n");
+            esp_tcp_close_verbose(3000);
+        } else {
+            dbg_print("[TEST] Could NOT open TCP for PCAP test\r\n");
+        }
+    } else {
+        dbg_print("[WIFI] join failed - will retry on send\r\n");
+    }
+
+    uint32_t last_test_ms = 0;
+
+    while (1) {
+        /* Poll DMA parser */
+        parser_poll_dma();
+
+        /* millisecond tick */
+        uint32_t now = HAL_GetTick();
+
+        /* RTC every second */
+        if (now - last_rtc_print_ms >= 1000) {
+            last_rtc_print_ms = now;
+            dbg_print("[RTC] %02u-%02u-20%02u %02u:%02u:%02u\r\n",
+                      parsed_day, parsed_month, parsed_year_off,
+                      parsed_hour, parsed_minute, parsed_second);
+        }
+
+        /* === Frame parsed === */
+        if (frame_ready_flag) {
+            frame_ready_flag = 0;
+            float voltage  = parsed_voltage * 10.0f;
+            float current  = parsed_current;
+            float freq     = parsed_frequency * 10.0f;
+            float apparent = parsed_apparent;
+            float active   = parsed_active;
+            float pf       = parsed_pf;
+            char pfSign    = parsed_pfSign;
+
+            dbg_print("[DATA] %02u-%02u-20%02u %02u:%02u:%02u | "
+                      "V=%.2f I=%.3f P=%.1f PF=%c%.2f F=%.2f\r\n",
+                      parsed_day, parsed_month, parsed_year_off,
+                      parsed_hour, parsed_minute, parsed_second,
+                      voltage, current, active, pfSign, pf, freq);
+
+            float sample[N_VARS] = { current, voltage, active, apparent, pf, freq };
+
+            pca_prune_feed_sample(sample);
+            if (pca_prune_maybe_run_and_report()) {
+                const uint8_t *payload = NULL;
+                uint16_t payload_len = 0;
+                pca_prune_get_serialized_payload(&payload, &payload_len);
+
+                if (payload && payload_len > 0) {
+                    dbg_print("[SEND] Prepared payload %u bytes - attempting send\r\n", payload_len);
+                    if (!wifi_ready) {
+                        dbg_print("[WIFI] retry join...\r\n");
+                        if (esp_init_wifi_verbose(WIFI_SSID, WIFI_PASS, 10000)) {
+                            dbg_print("[WIFI] join OK (retry)\r_print");
+                            wifi_ready = true;
+                        } else {
+                            dbg_print("[WIFI] join retry FAILED\r\n");
+                            wifi_ready = false;
+                        }
+                    }
+                    if (wifi_ready) {
+                        if (esp_tcp_connect_verbose(HES_IP, HES_PORT, 5000)) {
+                            bool ok = esp_tcp_send_verbose(payload, payload_len, 5000);
+                            if (ok) dbg_print("[SEND] Payload sent OK (%u bytes)\r\n", payload_len);
+                            else dbg_print("[SEND] Payload send FAILED\r\n");
+                            esp_tcp_close_verbose(2000);
+                        } else {
+                            dbg_print("[SEND] CIPSTART failed\r\n");
+                            wifi_ready = false;
+                        }
+                    } else {
+                        dbg_print("[SEND] Not sending - no WiFi\r\n");
+                    }
+                } else {
+                    dbg_print("[SEND] No payload available after PCA run\r\n");
+                }
+            }
+        }
+
+        /* periodic HELLO test (every 5s) */
+        if (now - last_test_ms > 5000) {
+            last_test_ms = now;
+
+            const char *msg = "HELLO_FROM_STM32";
+            dbg_print("[TEST] Attempting WiFi send...\r\n");
+
+            if (!wifi_ready) {
+                dbg_print("[TEST] WiFi not ready, retry join\n");
+                if (esp_init_wifi_verbose(WIFI_SSID, WIFI_PASS, 15000)) {
+                    dbg_print("[TEST] WiFi joined\n");
+                    wifi_ready = true;
+                }
+            }
+
+            if (wifi_ready) {
+                dbg_print("[TEST] Opening TCP...\r\n");
+
+                if (esp_tcp_connect_verbose(HES_IP, HES_PORT, 5000)) {
+                    dbg_print("[TEST] Connected. Sending...\r\n");
+
+                    bool ok = esp_tcp_send_verbose((uint8_t*)msg,
+                                                   (uint16_t)strlen(msg),
+                                                   5000);
+
+                    if (ok)
+                        dbg_print("[TEST] Send OK\r\n");
+                    else
+                        dbg_print("[TEST] Send FAILED\r\n");
+
+                    esp_tcp_close_verbose(2000);
+                } else {
+                    dbg_print("[TEST] TCP open failed. Mark wifi not ready.\r\n");
+                    wifi_ready = false;
+                }
+            } else {
+                dbg_print("[TEST] Skipped send - WiFi not ready.\r\n");
+            }
+        }
+
+        HAL_Delay(1);
+    }
+}
+
+/* Clock config (your working version) */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 384;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLQ = 8;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
+
+  RCC_ClkInitStruct.ClockType =
+    RCC_CLOCKTYPE_HCLK |
+    RCC_CLOCKTYPE_SYSCLK |
+    RCC_CLOCKTYPE_PCLK1 |
+    RCC_CLOCKTYPE_PCLK2;
+
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3);
+}
+
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1) { }
+}
+
+
+
+/* esp_comm.c  (Option B - robust)
+ *
+ * Robust ESP-01 AT wrapper for STM32 HAL (UART5).
+ * - Flushes rx before important commands
+ * - Accumulates responses across multiple reads (avoid losing bytes)
+ * - Searches for expected tokens across the entire response
+ * - Prompt-delay before sending TCP payload
+ * - Extra debug hex/text dumps to help diagnose timing issues
+ *
+ * Expects:
+ *  - HAL (stm32) available
+ *  - MX_UART5_Init() configured for UART5 (huart5) at 115200
+ *  - dbg_print implemented in main.c (prints to huart3)
+ *
+ * Public API:
+ *   bool esp_send_at_and_print(const char *cmd, uint32_t timeout_ms);
+ *   bool esp_check_module(uint32_t timeout_ms);
+ *   bool esp_init_wifi_verbose(const char *ssid, const char *password, uint32_t timeout_ms);
+ *   bool esp_tcp_connect_verbose(const char *ip, int port, uint32_t timeout_ms);
+ *   bool esp_tcp_send_verbose(const uint8_t *data, uint16_t len, uint32_t timeout_ms);
+ *   void esp_tcp_close_verbose(uint32_t timeout_ms);
+ *
+ */
+
+#include "main.h"
+#include "usart.h"
+#include "gpio.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdbool.h>
+#include <ctype.h>
+
+/* -- CONFIG -- */
+#define ESP_UART_HANDLE        huart5
+extern UART_HandleTypeDef ESP_UART_HANDLE;
+extern UART_HandleTypeDef huart3;
+extern void dbg_print(const char *fmt, ...);
+
+/* Timeouts (ms) - tuned for reliability */
+#define ESP_OP_TIMEOUT_MS      10000U   /* general operations */
+#define ESP_PROMPT_TIMEOUT_MS   7000U   /* wait for '>' prompt */
+#define ESP_SEND_TIMEOUT_MS    12000U   /* after sending raw payload, wait for SEND OK */
+#define ESP_IDLE_GAP_MS         200U    /* idle gap to decide end of burst */
+#define ESP_READ_CHUNK_TO      60U      /* per-byte receive timeout used in loop */
+#define ESP_PROMPT_DELAY_MS     60U     /* delay after '>' before sending payload */
+#define ESP_MAX_RESP_LEN      1024      /* buffer size for response accumulation */
+
+/* Helper: dump bytes as hex + printable text preview */
+static void dump_hex_preview(const char *tag, const uint8_t *buf, int len)
+{
+    dbg_print("%s (len=%d):\r\n", tag, len);
+    /* hex row */
+    for (int i = 0; i < len; ++i) {
+        if ((i & 0x0F) == 0) dbg_print("  %04X: ", i);
+        dbg_print("%02X ", buf[i]);
+        if ((i & 0x0F) == 0x0F) dbg_print("\r\n");
+    }
+    if ((len & 0x0F) != 0) dbg_print("\r\n");
+    /* text preview (printable ascii, dot for others) */
+    char txt[65];
+    int copy = (len > 64) ? 64 : len;
+    for (int i = 0; i < copy; ++i) txt[i] = (isprint(buf[i]) ? buf[i] : '.');
+    txt[copy] = '\0';
+    dbg_print("  TEXT PREVIEW: \"%s\"\r\n", txt);
+}
+
+/* ============================================================
+ *  RX FLUSH / READ ACCUMULATOR
+ *  - uart_flush() to discard any pending bytes before sending
+ *  - read_until() accumulates into buffer until timeout or idle gap
+ * ============================================================*/
+
+/* Try to read and discard any waiting bytes (short window). */
+static void uart_flush(void)
+{
+    uint8_t ch;
+    uint32_t start = HAL_GetTick();
+    /* Try reading a few times to clear line */
+    while ((HAL_GetTick() - start) < 50) {
+        HAL_StatusTypeDef r = HAL_UART_Receive(&ESP_UART_HANDLE, &ch, 1, 10);
+        if (r != HAL_OK) break;
+        /* continue until no more bytes */
+        start = HAL_GetTick(); /* keep flushing within window */
+    }
+}
+
+/* Read into buf (size bytes) until overall timeout_ms or idle gap seen.
+ * Returns number of bytes placed in buf (0..size-1)
+ */
+static int read_until(uint8_t *buf, int size, uint32_t timeout_ms, uint32_t idle_gap_ms)
+{
+    if (!buf || size <= 1) return 0;
+    uint32_t tstart = HAL_GetTick();
+    uint32_t last_rx = tstart;
+    int idx = 0;
+    while ((HAL_GetTick() - tstart) < timeout_ms && idx < (size - 1)) {
+        uint8_t ch;
+        HAL_StatusTypeDef r = HAL_UART_Receive(&ESP_UART_HANDLE, &ch, 1, ESP_READ_CHUNK_TO);
+        if (r == HAL_OK) {
+            buf[idx++] = ch;
+            last_rx = HAL_GetTick();
+            /* keep reading immediately */
+        } else {
+            /* if we've seen data, and idle passed, break */
+            if ((HAL_GetTick() - last_rx) >= idle_gap_ms) break;
+            /* else continue trying until overall timeout */
+        }
+    }
+    buf[idx] = 0;
+    return idx;
+}
+
+/* Read and append into "out" string up to out_sz, performing multiple short reads
+   until either token is found in the accumulated buffer, or overall timeout.
+   Returns true if token found, false otherwise. The entire accumulated response is in out.
+*/
+static bool read_search_token(char *out, int out_sz, const char *token, uint32_t timeout_ms)
+{
+    if (!out || out_sz <= 1) return false;
+    uint32_t start = HAL_GetTick();
+    int cur_len = 0;
+    out[0] = '\0';
+    while ((HAL_GetTick() - start) < timeout_ms && cur_len < (out_sz - 1)) {
+        uint8_t tmp[256];
+        int got = read_until(tmp, sizeof(tmp), 600, ESP_IDLE_GAP_MS);
+        if (got > 0) {
+            int copy = (got < (out_sz - 1 - cur_len)) ? got : (out_sz - 1 - cur_len);
+            memcpy(&out[cur_len], tmp, copy);
+            cur_len += copy;
+            out[cur_len] = '\0';
+            /* debug short dump */
+            dbg_print("[ESP RAW chunk] appended %d bytes, total %d\r\n", got, cur_len);
+            /* if token requested, search */
+            if (token && strstr(out, token)) {
+                return true;
+            }
+            /* if buffer full, stop */
+            if (cur_len >= (out_sz - 1)) break;
+            /* small backoff to wait for more bytes */
+            HAL_Delay(25);
+            continue;
+        } else {
+            /* no bytes this small read; short wait */
+            HAL_Delay(20);
+        }
+    }
+    /* final search */
+    if (token && strstr(out, token)) return true;
+    return false;
+}
+
+/* ============================================================
+ *  RAW TX wrapper with debug + optional pre-flush
+ * ============================================================*/
+static bool send_raw_no_flush(const char *s, uint32_t timeout_ms)
+{
+    if (!s) return false;
+    size_t len = strlen(s);
+    if (len == 0) return true;
+    HAL_StatusTypeDef tx = HAL_UART_Transmit(&ESP_UART_HANDLE, (uint8_t*)s, (uint16_t)len, timeout_ms);
+    if (tx != HAL_OK) {
+        dbg_print("[ESP TX] HAL error %d\r\n", (int)tx);
+        return false;
+    }
+    return true;
+}
+
+/* Public: send raw but flush first (useful for commands) */
+static bool send_raw(const char *s, uint32_t timeout_ms)
+{
+    uart_flush();
+    return send_raw_no_flush(s, timeout_ms);
+}
+
+/* ============================================================
+ *  High-level send-and-print (diagnostic)
+ * ============================================================*/
+bool esp_send_at_and_print(const char *cmd, uint32_t timeout_ms)
+{
+    if (!cmd) return false;
+    char resp[ESP_MAX_RESP_LEN];
+    dbg_print("[ESP SEND] %s", cmd);
+    if (!send_raw(cmd, 2000)) {
+        dbg_print("[ESP] TX failed\r\n");
+        return false;
+    }
+    int got = read_until((uint8_t*)resp, sizeof(resp), timeout_ms, ESP_IDLE_GAP_MS);
+    if (got > 0) {
+        dump_hex_preview("[ESP RAW]", (uint8_t*)resp, got);
+        return true;
+    } else {
+        dbg_print("[ESP RAW] <timeout waiting for response>\r\n");
+        return false;
+    }
+}
+
+/* ============================================================
+ *  Send cmd and search for expected token (prints all)
+ * ============================================================*/
+static bool send_and_wait_for(const char *cmd, const char *expect, uint32_t timeout_ms)
+{
+    char acc[ESP_MAX_RESP_LEN];
+    if (cmd) dbg_print("[ESP CMD] %s", cmd);
+    /* flush stale bytes, then send */
+    uart_flush();
+    if (cmd) {
+        if (!send_raw_no_flush(cmd, 2000)) {
+            dbg_print("[ESP CMD] TX failed\r\n");
+            return false;
+        }
+    }
+    /* read and look for token */
+    bool found = read_search_token(acc, sizeof(acc), expect, timeout_ms);
+    if (strlen(acc) > 0) dump_hex_preview("[ESP RAW collected]", (uint8_t*)acc, (int)strlen(acc));
+    if (!found && expect) {
+        dbg_print("[ESP] Expected token '%s' NOT found in response.\r\n", expect);
+    }
+    return (expect == NULL) ? (strlen(acc) > 0) : found;
+}
+
+/* ============================================================
+ *  Module check
+ * ============================================================*/
+bool esp_check_module(uint32_t timeout_ms)
+{
+    dbg_print("[ESP CHECK] AT\r\n");
+    esp_send_at_and_print("AT\r\n", timeout_ms);
+    dbg_print("[ESP CHECK] AT+GMR\r\n");
+    esp_send_at_and_print("AT+GMR\r\n", timeout_ms);
+    return true;
+}
+
+/* ============================================================
+ *  WiFi init (robust)
+ * ============================================================*/
+bool esp_init_wifi_verbose(const char *ssid, const char *password, uint32_t timeout_ms)
+{
+    char cmd[256];
+
+    dbg_print("[ESP WIFI] init: disabling echo, resetting, set mode, then CWJAP\r\n");
+
+    /* Best-effort: disable echo and verify OK (if not, continue but still try) */
+    send_and_wait_for("ATE0\r\n", "OK", 1500);
+
+    /* Soft reset (give it a controlled, tolerant wait) */
+    send_raw_no_flush("AT+RST\r\n", 2000);
+    /* read some boot output (it prints a lot) */
+    {
+        char bootbuf[ESP_MAX_RESP_LEN];
+        int got = read_until((uint8_t*)bootbuf, sizeof(bootbuf), 3000, 150);
+        if (got > 0) dump_hex_preview("[ESP RAW (boot text)]", (uint8_t*)bootbuf, got);
+    }
+
+    /* set station mode */
+    if (!send_and_wait_for("AT+CWMODE=1\r\n", "OK", 2000)) {
+        dbg_print("[ESP WIFI] Warning: CWMODE=1 did not return OK (continuing)\r\n");
+    }
+
+    /* small settle */
+    HAL_Delay(150);
+
+    /* Build join command */
+    snprintf(cmd, sizeof(cmd), "AT+CWJAP=\"%s\",\"%s\"\r\n", ssid, password);
+
+    const int max_attempts = 6;
+    uint32_t attempt_delay = 700;
+
+    for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+        dbg_print("[ESP WIFI] CWJAP attempt %d/%d\r\n", attempt, max_attempts);
+
+        uart_flush();
+        if (!send_raw_no_flush(cmd, 2000)) {
+            dbg_print("[ESP WIFI] TX failed for CWJAP\r\n");
+            HAL_Delay(attempt_delay);
+            attempt_delay *= 2;
+            continue;
+        }
+
+        /* We'll accept a few possible success markers */
+        char collected[ESP_MAX_RESP_LEN];
+        collected[0] = '\0';
+
+        /* read for a longer window, but allow busy p... handling */
+        uint32_t window = timeout_ms + attempt * 800;
+        int got = read_until((uint8_t*)collected, sizeof(collected), window, 500);
+
+        if (got > 0) {
+            dump_hex_preview("[ESP RAW]", (uint8_t*)collected, got);
+
+            if (strstr(collected, "busy") || strstr(collected, "busy p")) {
+                dbg_print("[ESP WIFI] module busy, waiting 1500ms then re-read\r\n");
+                HAL_Delay(1500);
+                /* try read leftover */
+                int got2 = read_until((uint8_t*)collected, sizeof(collected), 2000, 300);
+                if (got2 > 0) dump_hex_preview("[ESP RAW after wait]", (uint8_t*)collected, got2);
+            }
+            if (strstr(collected, "WIFI GOT IP") || strstr(collected, "WIFI CONNECTED") || strstr(collected, "WIFI")) {
+                dbg_print("[ESP WIFI] join response contained WIFI -> success\r\n");
+                return true;
+            }
+            if (strstr(collected, "OK") && strstr(collected, "WIFI") == NULL) {
+                dbg_print("[ESP WIFI] got OK but no WIFI line, extra wait 2000ms\r\n");
+                HAL_Delay(2000);
+                int got3 = read_until((uint8_t*)collected, sizeof(collected), 2000, 300);
+                if (got3 > 0) {
+                    dump_hex_preview("[ESP RAW after extra wait]", (uint8_t*)collected, got3);
+                    if (strstr(collected, "WIFI GOT IP") || strstr(collected, "WIFI CONNECTED") || strstr(collected, "WIFI"))
+                        return true;
+                }
+            }
+            if (strstr(collected, "FAIL") || strstr(collected, "ERROR")) {
+                dbg_print("[ESP WIFI] response contained FAIL/ERROR, backing off %ums\r\n", attempt_delay);
+                HAL_Delay(attempt_delay);
+                attempt_delay *= 2;
+                continue;
+            }
+        } else {
+            dbg_print("[ESP WIFI] no response to CWJAP (attempt %d)\r\n", attempt);
+        }
+
+        HAL_Delay(attempt_delay);
+        attempt_delay *= 2;
+    }
+
+    dbg_print("[ESP WIFI] all join attempts failed\r\n");
+    return false;
+}
+
+/* ============================================================
+ *  TCP CONNECT
+ * ============================================================*/
+bool esp_tcp_connect_verbose(const char *ip, int port, uint32_t timeout_ms)
+{
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "AT+CIPSTART=\"TCP\",\"%s\",%d\r\n", ip, port);
+    dbg_print("[ESP TCP] CIPSTART -> %s:%d\r\n", ip, port);
+
+    /* send and wait for CONNECT or OK (accumulate response) */
+    uart_flush();
+    if (!send_raw_no_flush(cmd, 2000)) {
+        dbg_print("[ESP TCP] TX failed for CIPSTART\r\n");
+        return false;
+    }
+
+    /* read and search for CONNECT or OK */
+    char acc[ESP_MAX_RESP_LEN];
+    bool connected = read_search_token(acc, sizeof(acc), "CONNECT", timeout_ms);
+    if (!connected) {
+        /* if CONNECT not found, maybe firmware returns OK first */
+        if (strstr(acc, "OK") != NULL) {
+            dbg_print("[ESP TCP] CIPSTART returned OK (no CONNECT token yet)\r\n");
+            /* still accept OK as success */
+            dump_hex_preview("[ESP RAW after CIPSTART]", (uint8_t*)acc, (int)strlen(acc));
+            return true;
+        }
+        /* last chance: try one more small read */
+        int got = read_until((uint8_t*)acc, sizeof(acc), 2000, 200);
+        if (got > 0) dump_hex_preview("[ESP RAW extra after CIPSTART]", (uint8_t*)acc, got);
+    } else {
+        dbg_print("[ESP TCP] CIPSTART OK (CONNECT detected)\r\n");
+        return true;
+    }
+
+    dbg_print("[ESP TCP] CIPSTART FAILED (resp did not include CONNECT/OK)\r\n");
+    return false;
+}
+
+/* ============================================================
+ *  TCP SEND (waits for '>' prompt, then sends payload, then waits for SEND OK)
+ * ============================================================*/
+bool esp_tcp_send_verbose(const uint8_t *data, uint16_t len, uint32_t timeout_ms)
+{
+    if (!data || len == 0) return false;
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%u\r\n", (unsigned)len);
+
+    dbg_print("[ESP TCP] CIPSEND request -> %u bytes\r\n", (unsigned)len);
+
+    /* flush and send CIPSEND */
+    uart_flush();
+    if (!send_raw_no_flush(cmd, 2000)) {
+        dbg_print("[ESP TCP] failed to TX CIPSEND cmd\r\n");
+        return false;
+    }
+
+    /* Wait for '>' prompt within prompt timeout */
+    char acc[ESP_MAX_RESP_LEN];
+    acc[0] = 0;
+    bool got_prompt = read_search_token(acc, sizeof(acc), ">", ESP_PROMPT_TIMEOUT_MS);
+    if (!got_prompt) {
+        /* If we received something that contains ERROR or link is not valid, bail */
+        if (strstr(acc, "link is not valid") || strstr(acc, "ERROR")) {
+            dbg_print("[ESP TCP] CIPSEND response: link invalid/ERROR\r\n");
+            dump_hex_preview("[ESP RAW]", (uint8_t*)acc, (int)strlen(acc));
+            /* try to close link politely */
+            send_and_wait_for("AT+CIPCLOSE\r\n", "CLOSED", 2000);
+            return false;
+        }
+        dbg_print("[ESP TCP] No prompt after CIPSEND (got %d bytes)\r\n", (int)strlen(acc));
+        dump_hex_preview("[ESP RAW]", (uint8_t*)acc, (int)strlen(acc));
+        /* attempt a soft recover */
+        uint8_t esc = 0x1B;
+        HAL_UART_Transmit(&ESP_UART_HANDLE, &esc, 1, 50);
+        HAL_Delay(30);
+        send_raw_no_flush("AT\r\n", 200);
+        return false;
+    }
+
+    dbg_print("[ESP TCP] '>' prompt received — delaying %d ms then sending payload\r\n", ESP_PROMPT_DELAY_MS);
+    HAL_Delay(ESP_PROMPT_DELAY_MS);
+
+    /* Send raw payload bytes */
+    HAL_StatusTypeDef tx = HAL_UART_Transmit(&ESP_UART_HANDLE, (uint8_t*)data, len, ESP_SEND_TIMEOUT_MS);
+    if (tx != HAL_OK) {
+        dbg_print("[ESP TCP] raw TX failed (%d)\r\n", (int)tx);
+        return false;
+    }
+
+    /* Wait for SEND OK (or other informative response) */
+    char resp[ESP_MAX_RESP_LEN];
+    resp[0] = 0;
+    bool sendok = read_search_token(resp, sizeof(resp), "SEND OK", timeout_ms);
+    if (sendok) {
+        dbg_print("[ESP TCP] SEND OK (confirmed)\r\n");
+        dump_hex_preview("[ESP RAW after SEND]", (uint8_t*)resp, (int)strlen(resp));
+        return true;
+    } else {
+        dbg_print("[ESP TCP] no SEND OK (response):\r\n");
+        if (strlen(resp) > 0) dump_hex_preview("[ESP RAW after SEND]", (uint8_t*)resp, (int)strlen(resp));
+        else dbg_print("[ESP RAW after SEND] <none>\r\n");
+        return false;
+    }
+}
+
+/* ============================================================
+ *  Close TCP
+ * ============================================================*/
+void esp_tcp_close_verbose(uint32_t timeout_ms)
+{
+    send_and_wait_for("AT+CIPCLOSE\r\n", "CLOSED", timeout_ms);
+}
+
+
+
+fft file
+
+
+/* Core/Src/pca_prune.c
+   Your PCA code with added serialization accessor.
+   NOTE: keep N_VARS, BATCH_M macros consistent with your project.
+*/
+
+#include "pca_prune.h"
+#include "fft_utils.h"
+#include <string.h>
+#include <stdio.h>
+#include <math.h>
+#include "usart.h"
+extern UART_HandleTypeDef huart3;
+
+#include <stdarg.h>
+
+/* internal storage */
+static float data_buf[BATCH_M][N_VARS];
+static int sample_count = 0;
+
+/* static serialization buffer (returned via accessor) */
+#define SER_BUF_MAX 512
+static uint8_t ser_buf[SER_BUF_MAX];
+static uint16_t ser_len = 0;
+
+/* helpers */
+static void zero_buf(void) {
+    memset(data_buf, 0, sizeof(data_buf));
+    sample_count = 0;
+    ser_len = 0;
+}
+
+/* init */
+void pca_prune_init(void) {
+    zero_buf();
+    dbg_print("[PCA] pca_prune_init: BATCH_M=%d N_VARS=%d\r\n", BATCH_M, N_VARS);
+}
+
+/* feed sample (unchanged) */
+void pca_prune_feed_sample(const float sample[N_VARS]) {
+    if (sample == NULL) return;
+    if (sample_count < BATCH_M) {
+        for (int j = 0; j < N_VARS; ++j) data_buf[sample_count][j] = sample[j];
+        sample_count++;
+        dbg_print("[PCA] fed sample #%d: [", sample_count);
+        for (int j = 0; j < N_VARS; ++j) dbg_print("%.3f%s", sample[j], (j+1==N_VARS) ? "" : ", ");
+        dbg_print("]\r\n");
+    } else {
+        memmove(&data_buf[0], &data_buf[1], sizeof(float) * N_VARS * (BATCH_M - 1));
+        for (int j = 0; j < N_VARS; ++j) data_buf[BATCH_M - 1][j] = sample[j];
+        dbg_print("[PCA] buffer full -> rolling, still count=%d\r\n", sample_count);
+    }
+}
+
+/* compute means */
+static void compute_means(float means[N_VARS]) {
+    for (int j = 0; j < N_VARS; ++j) means[j] = 0.0f;
+    if (sample_count <= 0) return;
+    for (int i = 0; i < sample_count; ++i)
+        for (int j = 0; j < N_VARS; ++j)
+            means[j] += data_buf[i][j];
+    float inv = 1.0f / (float)sample_count;
+    for (int j = 0; j < N_VARS; ++j) means[j] *= inv;
+}
+
+/* covariance, power iteration, project, reconstruct (unchanged) */
+/* ... (reinclude the same compute_covariance, power_iteration_top1,
+   project_scores, reconstruct_from_scores, compute_mse_internal,
+   compute_total_variance functions from your prior file) ... */
+
+/* For brevity here, paste the unchanged functions from your file:
+   compute_covariance, power_iteration_top1, project_scores,
+   reconstruct_from_scores, compute_mse_internal, compute_total_variance
+   exactly as previously provided by you.
+*/
+
+/* --- begin unchanged functions (copy verbatim from your earlier file) --- */
+
+/* compute unbiased covariance matrix (N_VARS x N_VARS) */
+static void compute_covariance(const float means[N_VARS], float cov[N_VARS][N_VARS]) {
+    for (int i = 0; i < N_VARS; ++i)
+        for (int j = 0; j < N_VARS; ++j)
+            cov[i][j] = 0.0f;
+    if (sample_count < 2) return;
+    for (int t = 0; t < sample_count; ++t) {
+        for (int i = 0; i < N_VARS; ++i) {
+            float a = data_buf[t][i] - means[i];
+            for (int j = 0; j < N_VARS; ++j) {
+                float b = data_buf[t][j] - means[j];
+                cov[i][j] += a * b;
+            }
+        }
+    }
+    float denom = 1.0f / (float)(sample_count - 1);
+    for (int i = 0; i < N_VARS; ++i)
+        for (int j = 0; j < N_VARS; ++j)
+            cov[i][j] *= denom;
+}
+
+/* power iteration (top-1 eigenvector) */
+static void power_iteration_top1(const float cov[N_VARS][N_VARS], float eig[N_VARS]) {
+    for (int i = 0; i < N_VARS; ++i) eig[i] = 1.0f;
+    {
+        float s = 0.0f;
+        for (int i = 0; i < N_VARS; ++i) s += eig[i]*eig[i];
+        s = sqrtf(s); if (s <= 1e-12f) s = 1.0f;
+        for (int i = 0; i < N_VARS; ++i) eig[i] /= s;
+    }
+    for (int it = 0; it < 100; ++it) {
+        float y[N_VARS];
+        for (int i = 0; i < N_VARS; ++i) { y[i] = 0.0f; for (int j = 0; j < N_VARS; ++j) y[i] += cov[i][j] * eig[j]; }
+        float norm = 0.0f;
+        for (int i = 0; i < N_VARS; ++i) norm += y[i]*y[i];
+        if (norm <= 1e-20f) break;
+        norm = sqrtf(norm);
+        float diff = 0.0f;
+        for (int i = 0; i < N_VARS; ++i) {
+            float v = y[i]/norm;
+            float d = v - eig[i];
+            diff += d*d;
+            eig[i] = v;
+        }
+        if (diff < 1e-12f) break;
+    }
+}
+
+static void project_scores(const float means[N_VARS], const float eig[N_VARS], float scores[BATCH_M]) {
+    for (int t = 0; t < sample_count; ++t) {
+        float s = 0.0f;
+        for (int j = 0; j < N_VARS; ++j) s += (data_buf[t][j] - means[j]) * eig[j];
+        scores[t] = s;
+    }
+}
+
+static void reconstruct_from_scores(const float means[N_VARS], const float eig[N_VARS], const float scores[BATCH_M], float recon[BATCH_M][N_VARS]) {
+    for (int t = 0; t < sample_count; ++t)
+        for (int j = 0; j < N_VARS; ++j)
+            recon[t][j] = means[j] + scores[t] * eig[j];
+}
+
+static float compute_mse_internal(const float recon[BATCH_M][N_VARS]) {
+    double sse = 0.0;
+    for (int t = 0; t < sample_count; ++t)
+        for (int j = 0; j < N_VARS; ++j) {
+            double d = (double)data_buf[t][j] - (double)recon[t][j];
+            sse += d * d;
+        }
+    double denom = (double)sample_count * (double)N_VARS;
+    if (denom <= 0.0) return 0.0f;
+    return (float)(sse / denom);
+}
+
+static float compute_total_variance(const float means[N_VARS]) {
+    double s = 0.0;
+    for (int t = 0; t < sample_count; ++t)
+        for (int j = 0; j < N_VARS; ++j) {
+            double d = (double)data_buf[t][j] - (double)means[j];
+            s += d*d;
+        }
+    double denom = (double)sample_count * (double)N_VARS;
+    if (denom <= 0.0) return 0.0f;
+    return (float)(s / denom);
+}
+
+/* --- end unchanged functions --- */
+
+/* The main public function (mostly unchanged) */
+int pca_prune_maybe_run_and_report(void) {
+    static uint32_t last_run_ms = 0;
+    uint32_t now_ms = HAL_GetTick();
+
+    dbg_print("[PCA] maybe_run called: sample_count=%d last_run=%lu now=%lu elapsed=%lu\r\n",
+              sample_count, (unsigned long)last_run_ms, (unsigned long)now_ms, (unsigned long)(now_ms - last_run_ms));
+
+    if (sample_count < BATCH_M && (now_ms - last_run_ms) < 60000UL) {
+        dbg_print("[PCA] Not running: sample_count=%d elapsed=%lums (need %d or 60000ms)\r\n",
+                  sample_count, (unsigned long)(now_ms - last_run_ms), BATCH_M);
+        return 0;
+    }
+    if (sample_count < 4) {
+        dbg_print("[PCA] Not enough samples to run PCA (have %d)\r\n", sample_count);
+        return 0;
+    }
+
+    dbg_print("[PCA] Running PCA with %d samples (forced by timer/full)\r\n", sample_count);
+
+    /* 1) Means */
+    float means[N_VARS];
+    compute_means(means);
+
+    /* 2) Covariance */
+    float cov[N_VARS][N_VARS];
+    compute_covariance(means, cov);
+
+    /* 3) Top-1 eigvec */
+    float eigvec[N_VARS];
+    power_iteration_top1(cov, eigvec);
+
+    /* 4) Project -> scores */
+    float scores[BATCH_M];
+    project_scores(means, eigvec, scores);
+
+    /* 5) Reconstruct & MSE */
+    float recon[BATCH_M][N_VARS];
+    reconstruct_from_scores(means, eigvec, scores, recon);
+    float mse = compute_mse_internal(recon);
+
+    /* 6) total variance and savings estimate */
+    float tot_var = compute_total_variance(means);
+    float savings_pct = 0.0f;
+    if (tot_var > 1e-12f) savings_pct = (1.0f - (mse / tot_var)) * 100.0f;
+    if (savings_pct < 0.0f) savings_pct = 0.0f;
+
+    /* diagnostics (kept from your file) */
+    dbg_print("\r\n=== PCA PRUNE REPORT ===\r\n");
+    dbg_print("Samples: %d  N_VARS: %d  BATCH_M: %d\r\n", sample_count, N_VARS, BATCH_M);
+    dbg_print("eigvec: ");
+    for (int j = 0; j < N_VARS; ++j) dbg_print("%.4f ", eigvec[j]);
+    dbg_print("\r\n");
+    dbg_print("means:  ");
+    for (int j = 0; j < N_VARS; ++j) dbg_print("%.3f ", means[j]);
+    dbg_print("\r\n");
+    dbg_print("MSE=%.6f  TotVar=%.6f  EstimatedSavings=%.2f%%\r\n",
+              mse, tot_var, savings_pct);
+
+    /* FFT prune of the top-1 scores (compressive sensing) */
+    {
+        int16_t qre[MAX_KEEP_BINS];
+        int16_t qim[MAX_KEEP_BINS];
+        int kept_idx[MAX_KEEP_BINS];
+        int kept_n = 0;
+        int qbytes = 0;
+        float recon_mse = 0.0f;
+
+        int rc = fft_prune(scores, sample_count,
+                           qre, qim, kept_idx, &kept_n,
+                           &qbytes, &recon_mse);
+        if (rc == 0) {
+            dbg_print("\r\n--- FFT PRUNE (scores) ---\r\n");
+            dbg_print("Kept bins: %d  QuantBytes=%d  ReconMSE=%.6f\r\n", kept_n, qbytes, recon_mse);
+            dbg_print("Indices: ");
+            for (int i = 0; i < kept_n; ++i) dbg_print("%d ", kept_idx[i]);
+            dbg_print("\r\nQuantized (re,im): ");
+            for (int i = 0; i < kept_n; ++i) dbg_print("%d,%d ", (int)qre[i], (int)qim[i]);
+            dbg_print("\r\n");
+
+            int bytes_means = N_VARS * 4;
+            int bytes_eigvec = N_VARS * 4;
+            int total_bytes = bytes_means + bytes_eigvec + qbytes;
+            float raw_bytes = (float)sample_count * N_VARS * sizeof(float);
+            float real_saved = 100.0f * (1.0f - ((float)total_bytes / raw_bytes));
+            dbg_print("Bytes: raw=%d compressed(est)=%d saved=%.2f%%\r\n", (int)raw_bytes, total_bytes, real_saved);
+
+            /* === Build serialized payload into ser_buf ===
+             * Format (little-endian):
+             * [4] 'P' 'C' 'A' 'P'
+             * [2] uint16_t sample_count
+             * [1] uint8_t N_VARS
+             * [4*N_VARS] means floats
+             * [4*N_VARS] eigvec floats
+             * [2] uint16_t kept_n
+             * [2*kept_n] uint16_t kept_idx
+             * [2*kept_n] int16_t qre
+             * [2*kept_n] int16_t qim
+             */
+            uint8_t *p = ser_buf;
+            int remaining = SER_BUF_MAX;
+            /* magic */
+            if (remaining < 4) { dbg_print("[PCA] ser buf too small\r\n"); }
+            memcpy(p, "PCAP", 4); p += 4; remaining -= 4;
+            /* sample_count */
+            if (remaining < 2) { dbg_print("[PCA] ser buf too small\r\n"); }
+            *(uint16_t*)p = (uint16_t)sample_count; p += 2; remaining -= 2;
+            /* N_VARS */
+            *p++ = (uint8_t)N_VARS; remaining -= 1;
+            /* means */
+            if (remaining < 4*N_VARS) { dbg_print("[PCA] ser buf too small\r\n"); }
+            memcpy(p, means, 4*N_VARS); p += 4*N_VARS; remaining -= 4*N_VARS;
+            /* eigvec */
+            memcpy(p, eigvec, 4*N_VARS); p += 4*N_VARS; remaining -= 4*N_VARS;
+            /* kept_n */
+            *(uint16_t*)p = (uint16_t)kept_n; p += 2; remaining -= 2;
+            /* kept_idx */
+            for (int i = 0; i < kept_n; ++i) { *(uint16_t*)p = (uint16_t)kept_idx[i]; p += 2; remaining -= 2; }
+            /* qre */
+            for (int i = 0; i < kept_n; ++i) { *(int16_t*)p = qre[i]; p += 2; remaining -= 2; }
+            /* qim */
+            for (int i = 0; i < kept_n; ++i) { *(int16_t*)p = qim[i]; p += 2; remaining -= 2; }
+
+            ser_len = (uint16_t)(p - ser_buf);
+            dbg_print("[PCA] Serialized payload built: %d bytes\r\n", (int)ser_len);
+        } else {
+            dbg_print("[PCA] fft_prune failed rc=%d\r\n", rc);
+            ser_len = 0;
+        }
+    }
+
+    dbg_print("\r\n[PCA_SUMMARY] MSE=%.6f | TotVar=%.6f | Explained=%.2f%% | Samples=%d\r\n",
+              mse, tot_var, (tot_var>1e-9f) ? (100.0f*(1.0f - mse / tot_var)) : 0.0f, sample_count);
+    dbg_print("========================\r\n");
+
+    /* reset batch */
+    zero_buf();
+    last_run_ms = now_ms;
+    return 1;
+}
+
+/* accessor */
+void pca_prune_get_serialized_payload(const uint8_t **ptr, uint16_t *len)
+{
+    if (ptr) *ptr = ser_buf;
+    if (len) *len = ser_len;
+}
+
+
+///*
+// * Core/Src/pca_prune.c
+// *
+// * PCA + pruning module (top-1 PCA) with verbose diagnostics and FFT-prune integration
+// * + serialized payload builder for WiFi transmission.
+// */
+//
+//#include "pca_prune.h"
+//#include "fft_utils.h"
+//#include <string.h>
+//#include <stdio.h>
+//#include <math.h>
+//#include "usart.h"
+//extern UART_HandleTypeDef huart3;
+//
+//#include <stdarg.h>
+//
+///* ----------------------------------------------------------------------------------
+// *   dbg_print (you already rely on this; we keep it same)
+// * ---------------------------------------------------------------------------------- */
+//void dbg_print(const char *fmt, ...) {
+//    char buf[256];
+//    va_list args;
+//    va_start(args, fmt);
+//    vsnprintf(buf, sizeof(buf), fmt, args);
+//    va_end(args);
+//    HAL_UART_Transmit(&huart3, (uint8_t*)buf, strlen(buf), HAL_MAX_DELAY);
+//}
+//
+///* Expect dbg_print implemented in main.c (blocking via huart3) */
+//extern void dbg_print(const char *fmt, ...);
+//
+///* ----------------------------------------------------------------------------------
+// *  Internal data
+// * ---------------------------------------------------------------------------------- */
+//static float data_buf[BATCH_M][N_VARS];
+//static int sample_count = 0;
+//
+///* ----------------------------------------------------------------------------------
+// *  Serialization Buffer (NEW)
+// * ---------------------------------------------------------------------------------- */
+//#ifndef PCA_PRUNE_MAX_PAYLOAD
+//#define PCA_PRUNE_MAX_PAYLOAD 1024
+//#endif
+//
+//static uint8_t last_payload[PCA_PRUNE_MAX_PAYLOAD];
+//static uint16_t last_payload_len = 0;
+//
+///* accessor for main.c */
+//void pca_prune_get_serialized_payload(const uint8_t **ptr, uint16_t *len)
+//{
+//    if (ptr) *ptr = last_payload;
+//    if (len) *len = last_payload_len;
+//}
+//
+///* builder (NEW) */
+//static void pca_prune_build_serialized_payload(const float *eigvec,
+//                                               const float *means,
+//                                               const float *scores)
+//{
+//    uint8_t *p = last_payload;
+//
+//    /* header */
+//    memcpy(p, "PRUN", 4); p += 4;
+//    *p++ = 1;                  // version
+//    *p++ = (uint8_t)N_VARS;    // number of variables
+//
+//    uint16_t bm = (uint16_t)BATCH_M;
+//    memcpy(p, &bm, 2); p += 2;
+//
+//    /* quantization scale: find max abs score */
+//    float max_abs = 0.f;
+//    for (int i = 0; i < BATCH_M; i++) {
+//        float v = scores[i];
+//        if (v < 0) v = -v;
+//        if (v > max_abs) max_abs = v;
+//    }
+//
+//    float scale = (max_abs < 1e-6f) ? 1.f : (max_abs / 30000.f);
+//    memcpy(p, &scale, 4); p += 4;
+//
+//    /* eigvec (float32) */
+//    for (int i = 0; i < N_VARS; i++) {
+//        float v = eigvec[i];
+//        memcpy(p, &v, 4); p += 4;
+//    }
+//
+//    /* means (float32) */
+//    for (int i = 0; i < N_VARS; i++) {
+//        float v = means[i];
+//        memcpy(p, &v, 4); p += 4;
+//    }
+//
+//    /* quantized PC1 time series */
+//    for (int i = 0; i < BATCH_M; i++) {
+//        float fv = scores[i];
+//        int32_t q = (int32_t)roundf(fv / scale);
+//        if (q > 32767) q = 32767;
+//        if (q < -32768) q = -32768;
+//        int16_t qi = (int16_t)q;
+//        memcpy(p, &qi, 2); p += 2;
+//    }
+//
+//    last_payload_len = (uint16_t)(p - last_payload);
+//
+//    dbg_print("[PCA] Serialized payload built: %u bytes\r\n", last_payload_len);
+//}
+//
+///* ----------------------------------------------------------------------------------
+// *  Helpers
+// * ---------------------------------------------------------------------------------- */
+//static void zero_buf(void) {
+//    memset(data_buf, 0, sizeof(data_buf));
+//    sample_count = 0;
+//}
+//
+///* init */
+//void pca_prune_init(void) {
+//    zero_buf();
+//    dbg_print("[PCA] pca_prune_init: BATCH_M=%d N_VARS=%d\r\n", BATCH_M, N_VARS);
+//}
+//
+///* feed sample */
+//void pca_prune_feed_sample(const float sample[N_VARS]) {
+//    if (!sample) return;
+//    if (sample_count < BATCH_M) {
+//        for (int j = 0; j < N_VARS; ++j)
+//            data_buf[sample_count][j] = sample[j];
+//        sample_count++;
+//
+//        dbg_print("[PCA] fed sample #%d: [", sample_count);
+//        for (int j = 0; j < N_VARS; ++j)
+//            dbg_print("%.3f%s", sample[j], (j+1==N_VARS ? "" : ", "));
+//        dbg_print("]\r\n");
+//    } else {
+//        /* rolling replace */
+//        memmove(&data_buf[0], &data_buf[1], sizeof(float)*N_VARS*(BATCH_M-1));
+//        for (int j = 0; j < N_VARS; j++) data_buf[BATCH_M-1][j] = sample[j];
+//        dbg_print("[PCA] buffer full: rolling\r\n");
+//    }
+//}
+//
+///* mean */
+//static void compute_means(float means[N_VARS]) {
+//    for (int j = 0; j < N_VARS; j++) means[j] = 0.f;
+//    if (sample_count <= 0) return;
+//
+//    for (int t = 0; t < sample_count; t++)
+//        for (int j = 0; j < N_VARS; j++)
+//            means[j] += data_buf[t][j];
+//
+//    float inv = 1.f / sample_count;
+//    for (int j = 0; j < N_VARS; j++) means[j] *= inv;
+//}
+//
+///* covariance */
+//static void compute_covariance(const float means[N_VARS], float cov[N_VARS][N_VARS]) {
+//    for (int i = 0; i < N_VARS; i++)
+//        for (int j = 0; j < N_VARS; j++)
+//            cov[i][j] = 0.f;
+//
+//    if (sample_count < 2) return;
+//
+//    for (int t = 0; t < sample_count; t++) {
+//        for (int i = 0; i < N_VARS; i++) {
+//            float a = data_buf[t][i] - means[i];
+//            for (int j = 0; j < N_VARS; j++)
+//                cov[i][j] += a * (data_buf[t][j] - means[j]);
+//        }
+//    }
+//
+//    float denom = 1.f / (sample_count - 1);
+//    for (int i = 0; i < N_VARS; i++)
+//        for (int j = 0; j < N_VARS; j++)
+//            cov[i][j] *= denom;
+//}
+//
+///* power iteration */
+//static void power_iteration_top1(const float cov[N_VARS][N_VARS], float eig[N_VARS]) {
+//    for (int i = 0; i < N_VARS; i++) eig[i] = 1.f;
+//
+//    float norm = 0.f;
+//    for (int i = 0; i < N_VARS; i++) norm += eig[i]*eig[i];
+//    norm = sqrtf(norm);
+//    for (int i = 0; i < N_VARS; i++) eig[i] /= norm;
+//
+//    for (int it = 0; it < 100; it++) {
+//        float y[N_VARS];
+//        for (int i = 0; i < N_VARS; i++) {
+//            y[i] = 0.f;
+//            for (int j = 0; j < N_VARS; j++)
+//                y[i] += cov[i][j] * eig[j];
+//        }
+//        float nrm = 0.f;
+//        for (int i = 0; i < N_VARS; i++) nrm += y[i]*y[i];
+//        if (nrm < 1e-20f) break;
+//        nrm = sqrtf(nrm);
+//
+//        float diff = 0.f;
+//        for (int i = 0; i < N_VARS; i++) {
+//            float v = y[i] / nrm;
+//            float d = v - eig[i];
+//            diff += d*d;
+//            eig[i] = v;
+//        }
+//        if (diff < 1e-12f) break;
+//    }
+//}
+//
+///* project */
+//static void project_scores(const float means[N_VARS], const float eig[N_VARS], float scores[BATCH_M]) {
+//    for (int t = 0; t < sample_count; t++) {
+//        float s = 0.f;
+//        for (int j = 0; j < N_VARS; j++)
+//            s += (data_buf[t][j] - means[j]) * eig[j];
+//        scores[t] = s;
+//    }
+//}
+//
+///* reconstruct */
+//static void reconstruct_from_scores(const float means[N_VARS], const float eig[N_VARS],
+//                                    const float scores[BATCH_M],
+//                                    float recon[BATCH_M][N_VARS])
+//{
+//    for (int t = 0; t < sample_count; t++)
+//        for (int j = 0; j < N_VARS; j++)
+//            recon[t][j] = means[j] + scores[t] * eig[j];
+//}
+//
+///* MSE */
+//static float compute_mse_internal(const float recon[BATCH_M][N_VARS]) {
+//    double sse = 0.0;
+//    for (int t = 0; t < sample_count; t++)
+//        for (int j = 0; j < N_VARS; j++) {
+//            double d = (double)data_buf[t][j] - (double)recon[t][j];
+//            sse += d*d;
+//        }
+//    double denom = (double)sample_count * (double)N_VARS;
+//    if (denom <= 0.0) return 0.f;
+//    return (float)(sse / denom);
+//}
+//
+///* total variance */
+//static float compute_total_variance(const float means[N_VARS]) {
+//    double s = 0.0;
+//    for (int t = 0; t < sample_count; t++)
+//        for (int j = 0; j < N_VARS; j++) {
+//            double d = (double)data_buf[t][j] - (double)means[j];
+//            s += d*d;
+//        }
+//    double denom = (double)sample_count * (double)N_VARS;
+//    if (denom <= 0.0) return 0.f;
+//    return (float)(s / denom);
+//}
+//
+///* ----------------------------------------------------------------------------------
+// * MAIN PCA FUNCTION (returns 1 if PCA run)
+// * ---------------------------------------------------------------------------------- */
+//int pca_prune_maybe_run_and_report(void)
+//{
+//    static uint32_t last_run_ms = 0;
+//    uint32_t now_ms = HAL_GetTick();
+//
+//    dbg_print("[PCA] maybe_run: sample_count=%d elapsed=%lums\r\n",
+//              sample_count, (unsigned long)(now_ms - last_run_ms));
+//
+//    if (sample_count < BATCH_M && (now_ms - last_run_ms) < 60000UL) {
+//        dbg_print("[PCA] Not running (need full/60s)\r\n");
+//        return 0;
+//    }
+//    if (sample_count < 4) {
+//        dbg_print("[PCA] Too few samples\r\n");
+//        return 0;
+//    }
+//
+//    dbg_print("[PCA] Running PCA over %d samples\r\n", sample_count);
+//
+//    /* means */
+//    float means[N_VARS];
+//    compute_means(means);
+//
+//    /* covariance */
+//    float cov[N_VARS][N_VARS];
+//    compute_covariance(means, cov);
+//
+//    /* eigvec */
+//    float eigvec[N_VARS];
+//    power_iteration_top1(cov, eigvec);
+//
+//    /* project -> scores */
+//    float scores[BATCH_M];
+//    project_scores(means, eigvec, scores);
+//
+//    /* reconstruct */
+//    float recon[BATCH_M][N_VARS];
+//    reconstruct_from_scores(means, eigvec, scores, recon);
+//
+//    float mse = compute_mse_internal(recon);
+//    float tot_var = compute_total_variance(means);
+//
+//    float explained = 0.f;
+//    if (tot_var > 1e-12f) explained = 100.f * (1.f - mse / tot_var);
+//
+//    /* --- Standard PCA report (unchanged) --- */
+//    dbg_print("\r\n=== PCA PRUNE REPORT ===\r\n");
+//    dbg_print("Samples=%d  N_VARS=%d BATCH_M=%d\r\n", sample_count, N_VARS, BATCH_M);
+//
+//    dbg_print("eigvec: ");
+//    for (int j = 0; j < N_VARS; j++) dbg_print("%.4f ", eigvec[j]);
+//    dbg_print("\r\n");
+//
+//    dbg_print("means:  ");
+//    for (int j = 0; j < N_VARS; j++) dbg_print("%.3f ", means[j]);
+//    dbg_print("\r\n");
+//
+//    dbg_print("MSE=%.6f TotVar=%.6f ExplainedVar=%.2f%%\r\n", mse, tot_var, explained);
+//
+//    /* --- FFT prune section (unchanged) --- */
+//    {
+//        int16_t qre[MAX_KEEP_BINS];
+//        int16_t qim[MAX_KEEP_BINS];
+//        int kept_idx[MAX_KEEP_BINS];
+//        int kept_n = 0, qbytes = 0;
+//        float recon_mse = 0.f;
+//
+//        int rc = fft_prune(scores, sample_count,
+//                           qre, qim, kept_idx, &kept_n, &qbytes, &recon_mse);
+//
+//        if (rc == 0) {
+//            dbg_print("\r\n--- FFT PRUNE ---\r\n");
+//            dbg_print("Kept=%d  QuantBytes=%d  ReconMSE=%.6f\r\n", kept_n, qbytes, recon_mse);
+//        }
+//    }
+//
+//    dbg_print("[PCA_SUMMARY] MSE=%.6f Explained=%.2f%%\r\n", mse, explained);
+//
+//    /* =====================================================
+//     * === SERIALIZATION ADDED HERE (for WiFi transmission)
+//     * ===================================================== */
+//    pca_prune_build_serialized_payload(eigvec, means, scores);
+//    dbg_print("[PCA] Serialized payload ready for main.c\r\n");
+//
+//    /* reset batch */
+//    zero_buf();
+//    last_run_ms = now_ms;
+//    return 1;
+//}
+
+
