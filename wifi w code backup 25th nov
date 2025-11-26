@@ -1,0 +1,1339 @@
+/* Core/Src/main.c - WiFi-enabled main (PERSISTENT TCP mode)
+   Assumes usart.c provides MX_UART5_Init() and global rx_dma_buf[].
+*/
+#include "main.h"
+#include "dma.h"
+#include "usart.h"
+#include "usb_otg.h"
+#include "gpio.h"
+#include "fft_utils.h"
+
+#include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <math.h>
+
+#include "pca_prune.h"
+#include "esp_comm.h"
+
+
+/* ====== PCAP TEST PAYLOAD (VALID FORMAT EXPECTED BY HES) ====== */
+/* 69-byte example with proper PCAP header + metadata */
+const uint8_t test_pcap_payload[] = {
+  0x50,0x43,0x41,0x50, /* "PCAP" */
+  0x04,0x00,           /* sample_count = 4 */
+  0x06,                /* n_vars = 6 */
+  /* means: 1,2,3,4,5,6 */
+  0x00,0x00,0x80,0x3F,
+  0x00,0x00,0x00,0x40,
+  0x00,0x00,0x40,0x40,
+  0x00,0x00,0x80,0x40,
+  0x00,0x00,0xA0,0x40,
+  0x00,0x00,0xC0,0x40,
+  /* eigvec 0,0,0,0,0,1 */
+  0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x00,
+  0x00,0x00,0x80,0x3F,
+  /* kept_n = 2 */
+  0x02,0x00,
+  /* kept_idx: 1,2 */
+  0x01,0x00, 0x02,0x00,
+  /* qre: 1000,2000 */
+  0xE8,0x03, 0xD0,0x07,
+  /* qim: -1000, -2000 */
+  0x18,0xFC, 0x30,0xF8
+};
+const uint16_t test_pcap_payload_len = sizeof(test_pcap_payload);
+
+
+
+#define HAVE_PCA_PRUNE 1
+
+#define FRAME_TOTAL_LEN   46
+#define FRAME_PAYLOAD_LEN 39
+#define FRAME_HEADER0 'T'
+#define FRAME_HEADER1 'H'
+#define FRAME_HEADER2 'D'
+#define FRAME_HEADER3 'C'
+
+#ifndef RX_DMA_BUF_LEN
+#define RX_DMA_BUF_LEN 128
+#endif
+
+extern volatile uint8_t rx_dma_buf[RX_DMA_BUF_LEN];
+
+/* forward prototype so calling before definition is fine */
+void SystemClock_Config(void);
+
+/* parser state and parsed vars (same as yours) */
+static uint8_t frame_buf[FRAME_TOTAL_LEN];
+static size_t frame_idx = 0;
+static int parser_state = 0;
+static uint16_t dma_last_pos = 0;
+
+static volatile float parsed_voltage = 0.0f;
+static volatile float parsed_current = 0.0f;
+static volatile float parsed_frequency = 0.0f;
+static volatile float parsed_apparent = 0.0f;
+static volatile float parsed_active = 0.0f;
+static volatile float parsed_pf = 0.0f;
+static volatile char  parsed_pfSign = ' ';
+
+static volatile uint8_t parsed_day = 0;
+static volatile uint8_t parsed_month = 0;
+static volatile uint8_t parsed_year_off = 0;
+static volatile uint8_t parsed_hour = 0;
+static volatile uint8_t parsed_minute = 0;
+static volatile uint8_t parsed_second = 0;
+
+static volatile uint8_t frame_ready_flag = 0;
+
+/* dbg_print on huart3 */
+void dbg_print(const char *fmt, ...)
+{
+    char tmp[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        uint16_t len = (uint16_t)((n < (int)sizeof(tmp)) ? n : (int)sizeof(tmp)-1);
+        HAL_UART_Transmit(&huart3, (uint8_t *)tmp, len, HAL_MAX_DELAY);
+    }
+}
+
+/* CRC helper and big-endian helpers (same as earlier) */
+static uint16_t crc16_modbus(const uint8_t *data, uint16_t len)
+{ uint16_t crc = 0xFFFF; for (uint16_t pos = 0; pos < len; pos++) { crc ^= data[pos]; for (uint8_t i=0;i<8;i++){ if (crc & 1) crc = (crc>>1) ^ 0xA001; else crc >>= 1; } } return crc; }
+static uint32_t read_u32_be(const uint8_t *p) { return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
+static uint16_t read_u16_be(const uint8_t *p) { return (uint16_t)((p[0]<<8)|p[1]); }
+
+/* parser_feed_byte & parser_poll_dma (same as earlier) */
+static void parser_feed_byte(uint8_t b)
+{
+    switch (parser_state) {
+    case 0:
+        if (b == FRAME_HEADER0) { frame_buf[0] = b; frame_idx = 1; parser_state = 1; }
+        break;
+    case 1:
+        if (frame_idx == 1 && b == FRAME_HEADER1) { frame_buf[frame_idx++] = b; parser_state = 2; }
+        else { parser_state = (b == FRAME_HEADER0) ? 1 : 0; frame_idx = (parser_state)?1:0; }
+        break;
+    case 2:
+        if (b == FRAME_HEADER2) { frame_buf[frame_idx++] = b; parser_state = 3; }
+        else { parser_state = (b == FRAME_HEADER0)?1:0; frame_idx = (parser_state)?1:0; }
+        break;
+    case 3:
+        if (b == FRAME_HEADER3) { frame_buf[frame_idx++] = b; parser_state = 4; }
+        else { parser_state = (b == FRAME_HEADER0)?1:0; frame_idx = (parser_state)?1:0; }
+        break;
+    case 4:
+        frame_buf[frame_idx++] = b;
+        if (b != FRAME_PAYLOAD_LEN) { parser_state = 0; frame_idx = 0; }
+        else parser_state = 5;
+        break;
+    case 5:
+        frame_buf[frame_idx++] = b;
+        if (frame_idx >= FRAME_TOTAL_LEN) {
+            uint16_t crc_calc = crc16_modbus(&frame_buf[5], FRAME_PAYLOAD_LEN);
+            uint16_t crc_rx = ((uint16_t)frame_buf[44] << 8) | frame_buf[45];
+            if (crc_calc == crc_rx) {
+                const uint8_t *pl = &frame_buf[5];
+                uint32_t voltage_mV    = read_u32_be(&pl[0]);
+                uint32_t current_mA    = read_u32_be(&pl[4]);
+                uint32_t realPower_w   = read_u32_be(&pl[8]);
+                uint32_t apparentPower = read_u32_be(&pl[16]);
+                uint16_t instPF_raw    = read_u16_be(&pl[20]);
+                char pfSign            = (char)pl[22];
+                uint16_t freq_raw      = read_u16_be(&pl[23]);
+                uint8_t day            = pl[33];
+                uint8_t month          = pl[34];
+                uint8_t year_off       = pl[35];
+                uint8_t hour           = pl[36];
+                uint8_t minute         = pl[37];
+                uint8_t second         = pl[38];
+
+                parsed_voltage   = ((float)voltage_mV)/1000.0f;
+                parsed_current   = ((float)current_mA)/1000.0f;
+                parsed_active    = (float)realPower_w;
+                parsed_apparent  = (float)apparentPower;
+                parsed_pf        = ((float)instPF_raw)/100.0f;
+                parsed_pfSign    = pfSign;
+                parsed_frequency = ((float)freq_raw)/100.0f;
+
+                parsed_day       = day;
+                parsed_month     = month;
+                parsed_year_off  = year_off;
+                parsed_hour      = hour;
+                parsed_minute    = minute;
+                parsed_second    = second;
+
+                frame_ready_flag = 1;
+            }
+            parser_state = 0; frame_idx = 0;
+        }
+        break;
+    default: parser_state = 0; frame_idx = 0; break;
+    }
+}
+
+static void parser_poll_dma(void)
+{
+    if (huart2.hdmarx == NULL) return;
+    uint16_t new_pos = (uint16_t)(RX_DMA_BUF_LEN - __HAL_DMA_GET_COUNTER(huart2.hdmarx));
+    if (new_pos != dma_last_pos) {
+        if (new_pos > dma_last_pos)
+            for (uint16_t i = dma_last_pos; i < new_pos; ++i) parser_feed_byte(rx_dma_buf[i]);
+        else {
+            for (uint16_t i = dma_last_pos; i < RX_DMA_BUF_LEN; ++i) parser_feed_byte(rx_dma_buf[i]);
+            for (uint16_t i = 0; i < new_pos; ++i) parser_feed_byte(rx_dma_buf[i]);
+        }
+        dma_last_pos = new_pos;
+    }
+}
+
+/* MAIN */
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_DMA_Init();
+    MX_USART3_UART_Init(); /* debug */
+    MX_USB_OTG_FS_PCD_Init();
+    MX_USART2_UART_Init(); /* meter UART */
+    MX_UART5_Init();       /* ESP UART (make sure usart.c uses MX_UART5_Init) */
+
+    dbg_print("[DIAG] Running ESP module check...\r\n");
+    esp_check_module(1000);
+
+    dbg_print("\r\n[BOOT] THDC + PCA + WiFi + RTC print active\r\n");
+
+#ifdef HAVE_PCA_PRUNE
+    pca_prune_init();
+#endif
+
+    /* start DMA for meter UART */
+    HAL_UART_Receive_DMA(&huart2, (uint8_t*)rx_dma_buf, RX_DMA_BUF_LEN);
+    dma_last_pos = (uint16_t)(RX_DMA_BUF_LEN - __HAL_DMA_GET_COUNTER(huart2.hdmarx));
+    dbg_print("DMA RX started (%u bytes)\r\n", RX_DMA_BUF_LEN);
+
+    uint32_t last_rtc_print_ms = 0;
+    bool wifi_ready = false;
+    bool tcp_persistent_open = false;
+
+    const char *WIFI_SSID = "RM 1725";
+    const char *WIFI_PASS = "877,2f3W";
+    const char *HES_IP = "192.168.137.1";
+    const int   HES_PORT = 5050;
+
+    /* try join at boot */
+    if (esp_init_wifi_verbose(WIFI_SSID, WIFI_PASS, 10000)) {
+        dbg_print("[WIFI] joined SSID OK\r\n");
+        wifi_ready = true;
+
+        /* open persistent TCP connection to HES immediately */
+        if (esp_tcp_open_persistent(HES_IP, HES_PORT, 8000)) {
+            dbg_print("[WIFI] persistent TCP open OK -> %s:%d\r\n", HES_IP, HES_PORT);
+            tcp_persistent_open = true;
+        } else {
+            dbg_print("[WIFI] persistent TCP open FAILED - will retry later\r\n");
+            tcp_persistent_open = false;
+        }
+    } else {
+        dbg_print("[WIFI] join failed - will retry on send\r\n");
+    }
+
+    uint32_t last_test_ms = 0;
+
+    while (1) {
+        /* Poll DMA parser */
+        parser_poll_dma();
+
+        /* millisecond tick */
+        uint32_t now = HAL_GetTick();
+
+        /* RTC every second */
+        if (now - last_rtc_print_ms >= 1000) {
+            last_rtc_print_ms = now;
+            dbg_print("[RTC] %02u-%02u-20%02u %02u:%02u:%02u\r\n",
+                      parsed_day, parsed_month, parsed_year_off,
+                      parsed_hour, parsed_minute, parsed_second);
+        }
+
+        /* === Frame parsed === */
+        if (frame_ready_flag) {
+            frame_ready_flag = 0;
+            float voltage  = parsed_voltage * 10.0f;
+            float current  = parsed_current;
+            float freq     = parsed_frequency * 10.0f;
+            float apparent = parsed_apparent;
+            float active   = parsed_active;
+            float pf       = parsed_pf;
+            char pfSign    = parsed_pfSign;
+
+            dbg_print("[DATA] %02u-%02u-20%02u %02u:%02u:%02u | "
+                      "V=%.2f I=%.3f P=%.1f PF=%c%.2f F=%.2f\r\n",
+                      parsed_day, parsed_month, parsed_year_off,
+                      parsed_hour, parsed_minute, parsed_second,
+                      voltage, current, active, pfSign, pf, freq);
+
+            float sample[N_VARS] = { current, voltage, active, apparent, pf, freq };
+
+            pca_prune_feed_sample(sample);
+            if (pca_prune_maybe_run_and_report()) {
+                const uint8_t *payload = NULL;
+                uint16_t payload_len = 0;
+                pca_prune_get_serialized_payload(&payload, &payload_len);
+
+                if (payload && payload_len > 0) {
+                    dbg_print("[SEND] Prepared payload %u bytes - attempting persistent send\r\n", payload_len);
+
+                    /* Ensure WiFi */
+                    if (!wifi_ready) {
+                        dbg_print("[WIFI] retry join...\r\n");
+                        if (esp_init_wifi_verbose(WIFI_SSID, WIFI_PASS, 10000)) {
+                            dbg_print("[WIFI] join OK (retry)\r\n");
+                            wifi_ready = true;
+                        } else {
+                            dbg_print("[WIFI] join retry FAILED\r\n");
+                            wifi_ready = false;
+                        }
+                    }
+
+                    /* Ensure persistent TCP */
+                    if (wifi_ready && !tcp_persistent_open) {
+                        dbg_print("[TCP] Attempting to open persistent TCP...\r\n");
+                        if (esp_tcp_open_persistent(HES_IP, HES_PORT, 8000)) {
+                            dbg_print("[TCP] persistent open OK\r\n");
+                            tcp_persistent_open = true;
+                        } else {
+                            dbg_print("[TCP] persistent open FAILED\r\n");
+                            tcp_persistent_open = false;
+                        }
+                    }
+
+                    /* Do persistent send */
+                    if (wifi_ready && tcp_persistent_open) {
+                        if (esp_tcp_send_persistent(payload, payload_len, 8000)) {
+                            dbg_print("[SEND] PCA payload sent OK (%u bytes)\r\n", payload_len);
+                        } else {
+                            dbg_print("[SEND] PCA payload failed. Closing persistent connection and will retry later.\r\n");
+                            esp_tcp_close_persistent(2000);
+                            tcp_persistent_open = false;
+                        }
+                    } else {
+                        dbg_print("[SEND] Skipped payload - WiFi or TCP not ready\r\n");
+                    }
+                } else {
+                    dbg_print("[SEND] No payload available after PCA run\r\n");
+                }
+            }
+        }
+
+        /* -------------------------------------------------------------
+           Persistent HELLO test (every 5s) - verifies persistent TCP.
+           Rather than open/close each time, we reuse the single persistent connection.
+           ------------------------------------------------------------- */
+//        if (now - last_test_ms > 5000) {
+//            last_test_ms = now;
+//
+//            const char *msg = "HELLO_PERSISTENT_STM32";
+//
+//            dbg_print("[TEST] Persistent test send...\r\n");
+//
+//            if (!wifi_ready) {
+//                dbg_print("[TEST] WiFi not ready, retry join\n");
+//                if (esp_init_wifi_verbose(WIFI_SSID, WIFI_PASS, 15000)) {
+//                    dbg_print("[TEST] WiFi joined\n");
+//                    wifi_ready = true;
+//                }
+//            }
+//
+//            if (wifi_ready && !tcp_persistent_open) {
+//                dbg_print("[TEST] TCP persistent not open, attempt open\n");
+//                if (esp_tcp_open_persistent(HES_IP, HES_PORT, 8000)) {
+//                    dbg_print("[TEST] persistent TCP opened\n");
+//                    tcp_persistent_open = true;
+//                } else {
+//                    dbg_print("[TEST] persistent TCP open failed\n");
+//                    tcp_persistent_open = false;
+//                }
+//            }
+//
+//            if (wifi_ready && tcp_persistent_open) {
+//                dbg_print("[TEST] Sending HELLO over persistent TCP...\r\n");
+//                if (esp_tcp_send_persistent((uint8_t*)msg, (uint16_t)strlen(msg), 5000)) {
+//                    dbg_print("[TEST] HELLO send OK\n");
+//                } else {
+//                    dbg_print("[TEST] HELLO send FAILED -> will close and retry later\n");
+//                    esp_tcp_close_persistent(2000);
+//                    tcp_persistent_open = false;
+//                }
+//            } else {
+//                dbg_print("[TEST] Skipped HELLO - no WiFi/TCP\n");
+//            }
+//        }
+
+        HAL_Delay(1);
+    }
+}
+
+/* Clock config (your working version) */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 384;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLQ = 8;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
+
+  RCC_ClkInitStruct.ClockType =
+    RCC_CLOCKTYPE_HCLK |
+    RCC_CLOCKTYPE_SYSCLK |
+    RCC_CLOCKTYPE_PCLK1 |
+    RCC_CLOCKTYPE_PCLK2;
+
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3);
+}
+
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1) { }
+}
+
+
+
+
+
+
+
+PCA_PRUNE.C FILE 
+/* Core/Src/pca_prune.c
+   PCA prune module — same PCA & FFT logic as before, debug throttling added.
+*/
+
+#include "pca_prune.h"
+#include "fft_utils.h"
+#include <string.h>
+#include <stdio.h>
+#include <math.h>
+#include "usart.h"
+extern UART_HandleTypeDef huart3;
+extern void dbg_print(const char *fmt, ...);
+
+#include <stdarg.h>
+
+/* -------------------- DEBUG CONTROL --------------------
+ * 0 = silent (only essential PCA_SUMMARY)
+ * 1 = summary + serialized payload messages (recommended for production)
+ * 2 = full verbose (original behavior)
+ */
+#ifndef PCA_DEBUG_LEVEL
+#define PCA_DEBUG_LEVEL 1
+#endif
+
+/* internal storage */
+static float data_buf[BATCH_M][N_VARS];
+static int sample_count = 0;
+
+/* static serialization buffer (returned via accessor) */
+#define SER_BUF_MAX 512
+static uint8_t ser_buf[SER_BUF_MAX];
+static uint16_t ser_len = 0;
+
+/* helpers */
+static void zero_buf(void) {
+    memset(data_buf, 0, sizeof(data_buf));
+    sample_count = 0;
+}
+
+
+/* init */
+void pca_prune_init(void) {
+    zero_buf();
+#if PCA_DEBUG_LEVEL >= 1
+    dbg_print("[PCA] pca_prune_init: BATCH_M=%d N_VARS=%d\r\n", BATCH_M, N_VARS);
+#endif
+}
+
+/* feed sample (unchanged logic) */
+void pca_prune_feed_sample(const float sample[N_VARS]) {
+    if (sample == NULL) return;
+    if (sample_count < BATCH_M) {
+        for (int j = 0; j < N_VARS; ++j) data_buf[sample_count][j] = sample[j];
+        sample_count++;
+#if PCA_DEBUG_LEVEL >= 2
+        dbg_print("[PCA] fed sample #%d: [", sample_count);
+        for (int j = 0; j < N_VARS; ++j) dbg_print("%.3f%s", sample[j], (j+1==N_VARS) ? "" : ", ");
+        dbg_print("]\r\n");
+#endif
+    } else {
+        memmove(&data_buf[0], &data_buf[1], sizeof(float) * N_VARS * (BATCH_M - 1));
+        for (int j = 0; j < N_VARS; ++j) data_buf[BATCH_M - 1][j] = sample[j];
+#if PCA_DEBUG_LEVEL >= 2
+        dbg_print("[PCA] buffer full -> rolling, still count=%d\r\n", sample_count);
+#endif
+    }
+}
+
+/* compute means */
+static void compute_means(float means[N_VARS]) {
+    for (int j = 0; j < N_VARS; ++j) means[j] = 0.0f;
+    if (sample_count <= 0) return;
+    for (int i = 0; i < sample_count; ++i)
+        for (int j = 0; j < N_VARS; ++j)
+            means[j] += data_buf[i][j];
+    float inv = 1.0f / (float)sample_count;
+    for (int j = 0; j < N_VARS; ++j) means[j] *= inv;
+}
+
+/* --- begin unchanged functions --- */
+
+/* compute unbiased covariance matrix (N_VARS x N_VARS) */
+static void compute_covariance(const float means[N_VARS], float cov[N_VARS][N_VARS]) {
+    for (int i = 0; i < N_VARS; ++i)
+        for (int j = 0; j < N_VARS; ++j)
+            cov[i][j] = 0.0f;
+    if (sample_count < 2) return;
+    for (int t = 0; t < sample_count; ++t) {
+        for (int i = 0; i < N_VARS; ++i) {
+            float a = data_buf[t][i] - means[i];
+            for (int j = 0; j < N_VARS; ++j) {
+                float b = data_buf[t][j] - means[j];
+                cov[i][j] += a * b;
+            }
+        }
+    }
+    float denom = 1.0f / (float)(sample_count - 1);
+    for (int i = 0; i < N_VARS; ++i)
+        for (int j = 0; j < N_VARS; ++j)
+            cov[i][j] *= denom;
+}
+
+/* power iteration (top-1 eigenvector) */
+static void power_iteration_top1(const float cov[N_VARS][N_VARS], float eig[N_VARS]) {
+    for (int i = 0; i < N_VARS; ++i) eig[i] = 1.0f;
+    {
+        float s = 0.0f;
+        for (int i = 0; i < N_VARS; ++i) s += eig[i]*eig[i];
+        s = sqrtf(s); if (s <= 1e-12f) s = 1.0f;
+        for (int i = 0; i < N_VARS; ++i) eig[i] /= s;
+    }
+    for (int it = 0; it < 100; ++it) {
+        float y[N_VARS];
+        for (int i = 0; i < N_VARS; ++i) { y[i] = 0.0f; for (int j = 0; j < N_VARS; ++j) y[i] += cov[i][j] * eig[j]; }
+        float norm = 0.0f;
+        for (int i = 0; i < N_VARS; ++i) norm += y[i]*y[i];
+        if (norm <= 1e-20f) break;
+        norm = sqrtf(norm);
+        float diff = 0.0f;
+        for (int i = 0; i < N_VARS; ++i) {
+            float v = y[i]/norm;
+            float d = v - eig[i];
+            diff += d*d;
+            eig[i] = v;
+        }
+        if (diff < 1e-12f) break;
+    }
+}
+
+static void project_scores(const float means[N_VARS], const float eig[N_VARS], float scores[BATCH_M]) {
+    for (int t = 0; t < sample_count; ++t) {
+        float s = 0.0f;
+        for (int j = 0; j < N_VARS; ++j) s += (data_buf[t][j] - means[j]) * eig[j];
+        scores[t] = s;
+    }
+}
+
+static void reconstruct_from_scores(const float means[N_VARS], const float eig[N_VARS], const float scores[BATCH_M], float recon[BATCH_M][N_VARS]) {
+    for (int t = 0; t < sample_count; ++t)
+        for (int j = 0; j < N_VARS; ++j)
+            recon[t][j] = means[j] + scores[t] * eig[j];
+}
+
+static float compute_mse_internal(const float recon[BATCH_M][N_VARS]) {
+    double sse = 0.0;
+    for (int t = 0; t < sample_count; ++t)
+        for (int j = 0; j < N_VARS; ++j) {
+            double d = (double)data_buf[t][j] - (double)recon[t][j];
+            sse += d * d;
+        }
+    double denom = (double)sample_count * (double)N_VARS;
+    if (denom <= 0.0) return 0.0f;
+    return (float)(sse / denom);
+}
+
+static float compute_total_variance(const float means[N_VARS]) {
+    double s = 0.0;
+    for (int t = 0; t < sample_count; ++t)
+        for (int j = 0; j < N_VARS; ++j) {
+            double d = (double)data_buf[t][j] - (double)means[j];
+            s += d*d;
+        }
+    double denom = (double)sample_count * (double)N_VARS;
+    if (denom <= 0.0) return 0.0f;
+    return (float)(s / denom);
+}
+
+/* --- end unchanged functions --- */
+
+/* The main public function (mostly unchanged, with reduced prints) */
+int pca_prune_maybe_run_and_report(void) {
+    static uint32_t last_run_ms = 0;
+    uint32_t now_ms = HAL_GetTick();
+
+#if PCA_DEBUG_LEVEL >= 2
+    dbg_print("[PCA] maybe_run called: sample_count=%d last_run=%lu now=%lu elapsed=%lu\r\n",
+              sample_count, (unsigned long)last_run_ms, (unsigned long)now_ms, (unsigned long)(now_ms - last_run_ms));
+#endif
+
+    if (sample_count < BATCH_M && (now_ms - last_run_ms) < 60000UL) {
+#if PCA_DEBUG_LEVEL >= 1
+        dbg_print("[PCA] Not running: sample_count=%d elapsed=%lums (need %d or 60000ms)\r\n",
+                  sample_count, (unsigned long)(now_ms - last_run_ms), BATCH_M);
+#endif
+        return 0;
+    }
+    if (sample_count < 4) {
+#if PCA_DEBUG_LEVEL >= 1
+        dbg_print("[PCA] Not enough samples to run PCA (have %d)\r\n", sample_count);
+#endif
+        return 0;
+    }
+
+#if PCA_DEBUG_LEVEL >= 1
+    dbg_print("[PCA] Running PCA with %d samples (forced by timer/full)\r\n", sample_count);
+#endif
+
+    /* 1) Means */
+    float means[N_VARS];
+    compute_means(means);
+
+    /* 2) Covariance */
+    float cov[N_VARS][N_VARS];
+    compute_covariance(means, cov);
+
+    /* 3) Top-1 eigvec */
+    float eigvec[N_VARS];
+    power_iteration_top1(cov, eigvec);
+
+    /* 4) Project -> scores */
+    float scores[BATCH_M];
+    project_scores(means, eigvec, scores);
+
+    /* 5) Reconstruct & MSE */
+    float recon[BATCH_M][N_VARS];
+    reconstruct_from_scores(means, eigvec, scores, recon);
+    float mse = compute_mse_internal(recon);
+
+    /* 6) total variance and savings estimate */
+    float tot_var = compute_total_variance(means);
+    float savings_pct = 0.0f;
+    if (tot_var > 1e-12f) savings_pct = (1.0f - (mse / tot_var)) * 100.0f;
+    if (savings_pct < 0.0f) savings_pct = 0.0f;
+
+#if PCA_DEBUG_LEVEL >= 2
+    /* diagnostics (very verbose) */
+    dbg_print("\r\n=== PCA PRUNE REPORT ===\r\n");
+    dbg_print("Samples: %d  N_VARS: %d  BATCH_M: %d\r\n", sample_count, N_VARS, BATCH_M);
+    dbg_print("eigvec: ");
+    for (int j = 0; j < N_VARS; ++j) dbg_print("%.4f ", eigvec[j]);
+    dbg_print("\r\n");
+    dbg_print("means:  ");
+    for (int j = 0; j < N_VARS; ++j) dbg_print("%.3f ", means[j]);
+    dbg_print("\r\n");
+    dbg_print("MSE=%.6f  TotVar=%.6f  EstimatedSavings=%.2f%%\r\n",
+              mse, tot_var, savings_pct);
+#endif
+
+    /* FFT prune of the top-1 scores (compressive sensing) */
+    {
+        int16_t qre[MAX_KEEP_BINS];
+        int16_t qim[MAX_KEEP_BINS];
+        int kept_idx[MAX_KEEP_BINS];
+        int kept_n = 0;
+        int qbytes = 0;
+        float recon_mse = 0.0f;
+
+        int rc = fft_prune(scores, sample_count,
+                           qre, qim, kept_idx, &kept_n,
+                           &qbytes, &recon_mse);
+        if (rc == 0) {
+#if PCA_DEBUG_LEVEL >= 2
+            dbg_print("\r\n--- FFT PRUNE (scores) ---\r\n");
+            dbg_print("Kept bins: %d  QuantBytes=%d  ReconMSE=%.6f\r\n", kept_n, qbytes, recon_mse);
+            dbg_print("Indices: ");
+            for (int i = 0; i < kept_n; ++i) dbg_print("%d ", kept_idx[i]);
+            dbg_print("\r\nQuantized (re,im): ");
+            for (int i = 0; i < kept_n; ++i) dbg_print("%d,%d ", (int)qre[i], (int)qim[i]);
+            dbg_print("\r\n");
+#endif
+
+            int bytes_means = N_VARS * 4;
+            int bytes_eigvec = N_VARS * 4;
+            int total_bytes = bytes_means + bytes_eigvec + qbytes;
+            float raw_bytes = (float)sample_count * N_VARS * sizeof(float);
+            float real_saved = 100.0f * (1.0f - ((float)total_bytes / raw_bytes));
+            dbg_print("Bytes: raw=%d compressed(est)=%d saved=%.2f%%\r\n", (int)raw_bytes, total_bytes, real_saved);
+        } else {
+#if PCA_DEBUG_LEVEL >= 1
+            dbg_print("[PCA] fft_prune failed rc=%d\r\n", rc);
+#endif
+            ser_len = 0;
+        }
+    }
+
+    /* === Build serialized payload into ser_buf ===
+     * Format (little-endian): matches existing main.c test payload expectation ("PCAP")
+     * [4] 'P' 'C' 'A' 'P'
+     * [2] uint16_t sample_count
+     * [1] uint8_t N_VARS
+     * [4*N_VARS] means floats
+     * [4*N_VARS] eigvec floats
+     * [2] uint16_t kept_n
+     * [2*kept_n] uint16_t kept_idx
+     * [2*kept_n] int16_t qre
+     * [2*kept_n] int16_t qim
+     */
+    {
+        uint8_t *p = ser_buf;
+        int remaining = SER_BUF_MAX;
+        ser_len = 0;
+
+        /* magic - keep "PCAP" to match main.c test payload */
+        if (remaining < 4) { dbg_print("[PCA] ser buf too small\r\n"); ser_len = 0; goto done_serial; }
+        memcpy(p, "PCAP", 4); p += 4; remaining -= 4;
+
+        /* sample_count */
+        if (remaining < 2) { dbg_print("[PCA] ser buf too small\r\n"); ser_len = 0; goto done_serial; }
+        *(uint16_t*)p = (uint16_t)sample_count; p += 2; remaining -= 2;
+
+        /* N_VARS */
+        if (remaining < 1) { dbg_print("[PCA] ser buf too small\r\n"); ser_len = 0; goto done_serial; }
+        *p++ = (uint8_t)N_VARS; remaining -= 1;
+
+        /* means */
+        if (remaining < 4*N_VARS) { dbg_print("[PCA] ser buf too small\r\n"); ser_len = 0; goto done_serial; }
+        memcpy(p, means, 4*N_VARS); p += 4*N_VARS; remaining -= 4*N_VARS;
+
+        /* eigvec */
+        if (remaining < 4*N_VARS) { dbg_print("[PCA] ser buf too small\r\n"); ser_len = 0; goto done_serial; }
+        memcpy(p, eigvec, 4*N_VARS); p += 4*N_VARS; remaining -= 4*N_VARS;
+
+        /* For simplicity: quantize full PC1 (not reusing FFT bins here) - but we already used fft_prune earlier.
+           To keep exact original behavior, copy kept_n/kept_idx/qre/qim if they exist.  (Here we re-run fft_prune
+           or reuse results -- in this file above we used local arrays; to avoid duplicating arrays, we'll store
+           nothing if ser buffer isn't large enough.)
+        */
+
+        /* We must recompute fft_prune results to fetch kept_n / kept_idx / qre / qim for serialization.
+           Simpler approach: call fft_prune again and serialize results. */
+        {
+            int16_t qre_tmp[MAX_KEEP_BINS];
+            int16_t qim_tmp[MAX_KEEP_BINS];
+            int kept_idx_tmp[MAX_KEEP_BINS];
+            int kept_n_tmp = 0;
+            int qbytes_tmp = 0;
+            float recon_mse_tmp = 0.0f;
+            int rc2 = fft_prune(scores, sample_count,
+                                qre_tmp, qim_tmp, kept_idx_tmp, &kept_n_tmp,
+                                &qbytes_tmp, &recon_mse_tmp);
+            if (rc2 == 0) {
+                /* kept_n */
+                if (remaining < 2) { dbg_print("[PCA] ser buf too small for kept_n\r\n"); ser_len = 0; goto done_serial; }
+                *(uint16_t*)p = (uint16_t)kept_n_tmp; p += 2; remaining -= 2;
+                /* kept_idx */
+                for (int i = 0; i < kept_n_tmp; ++i) {
+                    if (remaining < 2) { dbg_print("[PCA] ser buf too small for kept_idx\r\n"); ser_len = 0; goto done_serial; }
+                    *(uint16_t*)p = (uint16_t)kept_idx_tmp[i]; p += 2; remaining -= 2;
+                }
+                /* qre */
+                for (int i = 0; i < kept_n_tmp; ++i) {
+                    if (remaining < 2) { dbg_print("[PCA] ser buf too small for qre\r\n"); ser_len = 0; goto done_serial; }
+                    *(int16_t*)p = qre_tmp[i]; p += 2; remaining -= 2;
+                }
+                /* qim */
+                for (int i = 0; i < kept_n_tmp; ++i) {
+                    if (remaining < 2) { dbg_print("[PCA] ser buf too small for qim\r\n"); ser_len = 0; goto done_serial; }
+                    *(int16_t*)p = qim_tmp[i]; p += 2; remaining -= 2;
+                }
+            } else {
+                dbg_print("[PCA] fft_prune (second pass) failed rc=%d\r\n", rc2);
+                ser_len = 0;
+                goto done_serial;
+            }
+        }
+
+        ser_len = (uint16_t)(p - ser_buf);
+#if PCA_DEBUG_LEVEL >= 1
+        dbg_print("[PCA] Serialized payload built: %d bytes\r\n", (int)ser_len);
+#endif
+    }
+
+done_serial:
+
+    dbg_print("\r\n[PCA_SUMMARY] MSE=%.6f | TotVar=%.6f | Explained=%.2f%% | Samples=%d\r\n",
+              mse, tot_var, (tot_var>1e-9f) ? (100.0f*(1.0f - mse / tot_var)) : 0.0f, sample_count);
+    dbg_print("========================\r\n");
+
+    /* reset batch */
+    zero_buf();
+    last_run_ms = now_ms;
+    return 1;
+}
+
+/* accessor */
+void pca_prune_get_serialized_payload(const uint8_t **ptr, uint16_t *len)
+{
+    if (ptr) *ptr = ser_buf;
+    if (len) *len = ser_len;
+}
+
+
+
+
+ESPCOMM_C FILE
+/*
+ * esp_comm.c  (PRODUCTION-READY, PERSISTENT TCP)
+ *
+ * Robust ESP-01 AT wrapper for STM32 HAL (UART5).
+ * - Response reader with idle detection
+ * - Works around "busy p..." behavior
+ * - Prompt-delay fix (must wait before sending payload)
+ * - Soft recover on CIPSEND/CIPSTART failures
+ * - Persistent TCP mode: open once, reuse for many sends
+ * - Detailed debug prints
+ *
+ * Notes:
+ *  - Expects extern UART_HandleTypeDef huart5; extern UART_HandleTypeDef huart3; (debug on huart3)
+ *  - Uses blocking HAL UART calls (as per your setup)
+ */
+
+#include "main.h"
+#include "usart.h"
+#include "gpio.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdbool.h>
+
+/* ===== CONFIG ===== */
+#define ESP_DEFAULT_TIMEOUT     8000U   /* General operations (ms) */
+#define ESP_PROMPT_TIMEOUT      5000U   /* Waiting for '>' prompt (ms) */
+#define ESP_SEND_TIMEOUT        12000U  /* Sending payload (ms) */
+#define ESP_IDLE_GAP            200U    /* Idle gap for esp_read_resp (ms) */
+
+/* Mandatory 50ms delay after '>' before sending payload (some modules need this) */
+#define ESP_PROMPT_DELAY_MS     60U
+
+/* UART used for ESP */
+extern UART_HandleTypeDef huart5;
+extern UART_HandleTypeDef huart3;
+
+/* ESP UART handle macro - keep compatibility with earlier code */
+#define ESP_UART_HANDLE huart5
+
+/* dbg_print provided by main.c */
+extern void dbg_print(const char *fmt, ...);
+
+/* ============================================================
+ * Module state for persistent TCP
+ * ============================================================*/
+static bool esp_tcp_persistent_connected = false;
+static char esp_tcp_ip[32] = {0};
+static int  esp_tcp_port = 0;
+
+/* ============================================================
+ *     RESPONSE READER (with idle detection & chunked append)
+ * ============================================================*/
+static int esp_read_resp(char *buf, int maxlen, uint32_t timeout_ms, uint32_t idle_ms)
+{
+    if (!buf || maxlen < 2) return 0;
+
+    uint32_t start = HAL_GetTick();
+    uint32_t last  = start;
+    int idx = 0;
+
+    while ((HAL_GetTick() - start) < timeout_ms)
+    {
+        uint8_t ch;
+        HAL_StatusTypeDef r = HAL_UART_Receive(&ESP_UART_HANDLE, &ch, 1, 30);
+
+        if (r == HAL_OK)
+        {
+            if (idx < (maxlen - 1)) buf[idx++] = ch;
+            last = HAL_GetTick();
+        }
+        else
+        {
+            if ((HAL_GetTick() - last) >= idle_ms)
+                break;
+        }
+    }
+
+    if (idx >= maxlen) idx = maxlen - 1;
+    buf[idx] = 0;
+    return idx;
+}
+
+/* ============================================================
+ *    RAW SEND (no trailing read)
+ * ============================================================*/
+static bool esp_send_raw(const char *cmd, uint32_t timeout_ms)
+{
+    if (!cmd) return false;
+
+    HAL_StatusTypeDef tx = HAL_UART_Transmit(&ESP_UART_HANDLE,
+                                             (uint8_t*)cmd,
+                                             strlen(cmd),
+                                             timeout_ms);
+    if (tx != HAL_OK)
+    {
+        dbg_print("[ESP] TX error %d\r\n", tx);
+        return false;
+    }
+    return true;
+}
+
+/* ============================================================
+ *  SEND + PRINT RESPONSE (best-effort)
+ * ============================================================*/
+bool esp_send_at_and_print(const char *cmd, uint32_t timeout_ms)
+{
+    char resp[512];
+
+    dbg_print("[ESP SEND] %s", cmd);
+
+    if (!esp_send_raw(cmd, 2000))
+    {
+        dbg_print("[ESP] TX fail\r\n");
+        return false;
+    }
+
+    int got = esp_read_resp(resp, sizeof(resp), timeout_ms, ESP_IDLE_GAP);
+
+    if (got > 0)
+    {
+        dbg_print("[ESP RAW] %s\r\n", resp);
+        return true;
+    }
+
+    dbg_print("[ESP RAW] <timeout>\r\n");
+    return false;
+}
+
+/* ============================================================
+ *  CMD + EXPECT (returns true if 'expect' found in response)
+ * ============================================================*/
+static bool esp_send_cmd_expect_print(const char *cmd, const char *expect, uint32_t timeout_ms)
+{
+    char resp[512];
+
+    if (cmd)
+    {
+        dbg_print("[ESP SEND] %s", cmd);
+
+        if (!esp_send_raw(cmd, 2000))
+        {
+            dbg_print("[ESP] TX fail\r\n");
+            return false;
+        }
+    }
+
+    int got = esp_read_resp(resp, sizeof(resp), timeout_ms, ESP_IDLE_GAP);
+
+    if (got > 0)
+    {
+        dbg_print("[ESP RAW] %s\r\n", resp);
+        if (!expect) return true;
+        return strstr(resp, expect) != NULL;
+    }
+
+    dbg_print("[ESP RAW] <timeout>\r\n");
+    return false;
+}
+
+/* ============================================================
+ *   SOFT RECOVERY (abort CIPSEND, re-sync)
+ * ============================================================*/
+static void esp_soft_recover(void)
+{
+    dbg_print("[ESP] soft recover: send ESC, short AT, small delay\r\n");
+
+    uint8_t esc = 0x1B;
+    HAL_UART_Transmit(&ESP_UART_HANDLE, &esc, 1, 100);
+    HAL_Delay(30);
+    HAL_UART_Transmit(&ESP_UART_HANDLE, (uint8_t*)"AT\r\n", 4, 200);
+    HAL_Delay(120);
+}
+
+/* ============================================================
+ *   MODULE CHECK (public)
+ * ============================================================*/
+bool esp_check_module(uint32_t timeout_ms)
+{
+    dbg_print("[ESP CHECK] AT\r\n");
+    esp_send_at_and_print("AT\r\n", timeout_ms);
+
+    dbg_print("[ESP CHECK] AT+GMR\r\n");
+    esp_send_at_and_print("AT+GMR\r\n", timeout_ms);
+
+    return true;
+}
+
+/* ============================================================
+ *   WIFI INIT (robust)
+ * ============================================================*/
+bool esp_init_wifi_verbose(const char *ssid, const char *password, uint32_t timeout_ms)
+{
+    char cmd[256];
+    char resp[512];
+
+    dbg_print("[ESP WIFI] init: disabling echo, resetting, set mode, then CWJAP\r\n");
+
+    /* disable echo (best effort) */
+    esp_send_cmd_expect_print("ATE0\r\n", "OK", 2000);
+
+    /* reset and read boot text (best-effort) */
+    esp_send_raw("AT+RST\r\n", 2000);
+    (void) esp_read_resp(resp, sizeof(resp), 4000, 250);
+
+    /* set station mode */
+    esp_send_cmd_expect_print("AT+CWMODE=1\r\n", "OK", 2000);
+
+    HAL_Delay(200);
+
+    snprintf(cmd, sizeof(cmd), "AT+CWJAP=\"%s\",\"%s\"\r\n", ssid, password);
+
+    const int max_connect_attempts = 6;
+    uint32_t attempt_delay = 800U; /* ms */
+
+    for (int attempt = 1; attempt <= max_connect_attempts; ++attempt) {
+        dbg_print("[ESP WIFI] CWJAP attempt %d/%d\r\n", attempt, max_connect_attempts);
+
+        /* send join command */
+        if (!esp_send_raw(cmd, 2000)) {
+            dbg_print("[ESP WIFI] TX failed for CWJAP\r\n");
+            HAL_Delay(attempt_delay);
+            attempt_delay *= 2;
+            continue;
+        }
+
+        /* Wait longer (timeout_ms), but be tolerant of 'busy p' */
+        int got = esp_read_resp(resp, sizeof(resp), timeout_ms + (attempt * 1000U), 400);
+
+        if (got > 0) {
+            dbg_print("[ESP RAW] %s\r\n", resp);
+
+            /* If module says busy, wait a bit and try to read leftover */
+            if (strstr(resp, "busy") || strstr(resp, "busy p")) {
+                dbg_print("[ESP WIFI] module busy, waiting 1500ms then re-read\r\n");
+                HAL_Delay(1500);
+                (void) esp_read_resp(resp, sizeof(resp), 2000, 300);
+                dbg_print("[ESP RAW after wait] %s\r\n", resp);
+            }
+
+            /* Look for wifi join indicators */
+            if (strstr(resp, "WIFI CONNECTED") || strstr(resp, "WIFI GOT IP") || strstr(resp, "WIFI ")) {
+                dbg_print("[ESP WIFI] join response contained WIFI -> success\r\n");
+                return true;
+            }
+
+            /* if we got 'OK' but no WIFI lines, keep waiting small extra time */
+            if (strstr(resp, "OK") && (strstr(resp, "WIFI") == NULL)) {
+                dbg_print("[ESP WIFI] got OK but no WIFI line, extra wait 2000ms\r\n");
+                (void) esp_read_resp(resp, sizeof(resp), 2000, 300);
+                if (strstr(resp, "WIFI CONNECTED") || strstr(resp, "WIFI GOT IP") || strstr(resp, "WIFI "))
+                    return true;
+            }
+        } else {
+            dbg_print("[ESP WIFI] no response to CWJAP (attempt %d)\r\n", attempt);
+        }
+
+        /* If response contained 'FAIL' or 'ERROR' try again after delay */
+        if (strstr(resp, "FAIL") || strstr(resp, "ERROR")) {
+            dbg_print("[ESP WIFI] response contained FAIL/ERROR, backing off %ums\r\n", attempt_delay);
+            HAL_Delay(attempt_delay);
+            attempt_delay *= 2;
+            continue;
+        }
+
+        /* generic backoff before next try */
+        HAL_Delay(attempt_delay);
+        attempt_delay *= 2;
+    }
+
+    dbg_print("[ESP WIFI] all join attempts failed\r\n");
+    return false;
+}
+
+/* ============================================================
+ *   TCP CONNECT (one-shot helper; kept for compatibility)
+ * ============================================================*/
+bool esp_tcp_connect_verbose(const char *ip, int port, uint32_t timeout_ms)
+{
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd),
+             "AT+CIPSTART=\"TCP\",\"%s\",%d\r\n",
+             ip, port);
+
+    dbg_print("[ESP TCP] %s", cmd);
+
+    if (esp_send_cmd_expect_print(cmd, "CONNECT", timeout_ms))
+    {
+        dbg_print("[ESP TCP] CONNECT OK\r\n");
+        return true;
+    }
+
+    if (esp_send_cmd_expect_print(NULL, "OK", timeout_ms))
+    {
+        dbg_print("[ESP TCP] CIPSTART OK\r\n");
+        return true;
+    }
+
+    dbg_print("[ESP TCP] CIPSTART FAILED\r\n");
+    return false;
+}
+
+/* ============================================================
+ *   TCP SEND (one-shot helper; kept for compatibility)
+ * ============================================================*/
+bool esp_tcp_send_verbose(const uint8_t *data, uint16_t len, uint32_t timeout_ms)
+{
+    if (!data || len == 0) return false;
+
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%u\r\n", len);
+
+    dbg_print("[ESP TCP] CIPSEND %u bytes\r\n", len);
+
+    if (!esp_send_raw(cmd, 2000))
+    {
+        dbg_print("[ESP TCP] failed to TX CIPSEND\r\n");
+        return false;
+    }
+
+    /* Wait for '>' */
+    char resp[256];
+    int got = esp_read_resp(resp, sizeof(resp),
+                            ESP_PROMPT_TIMEOUT,
+                            200);
+
+    dbg_print("[ESP RAW] %s\r\n", resp);
+
+    if (got <= 0)
+    {
+        dbg_print("[ESP TCP] No prompt after CIPSEND\r\n");
+        esp_soft_recover();
+        return false;
+    }
+
+    if (!strstr(resp, ">"))
+    {
+        if (strstr(resp, "link is not valid"))
+        {
+            dbg_print("[ESP TCP] link invalid → resetting\r\n");
+            esp_send_cmd_expect_print("AT+CIPCLOSE\r\n", "CLOSED", 2000);
+            HAL_Delay(100);
+        }
+
+        esp_soft_recover();
+        return false;
+    }
+
+    /* MUST WAIT — STABILITY PATCH */
+    dbg_print("[ESP TCP] Prompt received → delaying %d ms\r\n", ESP_PROMPT_DELAY_MS);
+    HAL_Delay(ESP_PROMPT_DELAY_MS);
+
+    /* Send actual payload */
+    dbg_print("[ESP TCP] Sending RAW payload (%u bytes)\r\n", len);
+
+    HAL_StatusTypeDef tx =
+        HAL_UART_Transmit(&ESP_UART_HANDLE, (uint8_t*)data, len, ESP_SEND_TIMEOUT);
+
+    if (tx != HAL_OK)
+    {
+        dbg_print("[ESP TCP] TX fail (%d)\r\n", tx);
+        esp_soft_recover();
+        return false;
+    }
+
+    /* Wait for SEND OK */
+    got = esp_read_resp(resp, sizeof(resp),
+                        ESP_SEND_TIMEOUT,
+                        250);
+
+    if (got > 0)
+    {
+        dbg_print("[ESP RAW] %s\r\n", resp);
+
+        if (strstr(resp, "SEND OK"))
+        {
+            dbg_print("[ESP TCP] SEND OK\r\n");
+            return true;
+        }
+    }
+
+    dbg_print("[ESP TCP] SEND FAIL\r\n");
+    esp_soft_recover();
+    return false;
+}
+
+/* ============================================================
+ *   TCP CLOSE
+ * ============================================================*/
+void esp_tcp_close_verbose(uint32_t timeout_ms)
+{
+    esp_send_cmd_expect_print("AT+CIPCLOSE\r\n", "CLOSED", timeout_ms);
+}
+
+/* ============================================================
+ *   PERSISTENT TCP API (NEW)
+ *   - open once (esp_tcp_open_persistent)
+ *   - send many (esp_tcp_send_persistent)
+ *   - close (esp_tcp_close_persistent)
+ * ============================================================*/
+
+/* Internal helper: try to open TCP and set persistent state */
+bool esp_tcp_open_persistent(const char *ip, int port, uint32_t timeout_ms)
+{
+    if (!ip) return false;
+
+    /* if already open with same endpoint, return success */
+    if (esp_tcp_persistent_connected &&
+        strcmp(esp_tcp_ip, ip) == 0 && esp_tcp_port == port)
+    {
+        dbg_print("[ESP TCP PERSIST] already connected to %s:%d\r\n", ip, port);
+        return true;
+    }
+
+    /* close any previous connection first */
+    if (esp_tcp_persistent_connected) {
+        dbg_print("[ESP TCP PERSIST] closing stale persistent connection\r\n");
+        esp_tcp_close_verbose(2000);
+        esp_tcp_persistent_connected = false;
+    }
+
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd),
+             "AT+CIPSTART=\"TCP\",\"%s\",%d\r\n",
+             ip, port);
+
+    dbg_print("[ESP TCP PERSIST] Opening %s:%d\r\n", ip, port);
+
+    /* send and wait for CONNECT or OK */
+    if (esp_send_cmd_expect_print(cmd, "CONNECT", timeout_ms) ||
+        esp_send_cmd_expect_print(NULL, "OK", timeout_ms))
+    {
+        dbg_print("[ESP TCP PERSIST] CIPSTART OK -> persistent connected\r\n");
+        /* store endpoint */
+        strncpy(esp_tcp_ip, ip, sizeof(esp_tcp_ip)-1);
+        esp_tcp_port = port;
+        esp_tcp_persistent_connected = true;
+        return true;
+    }
+
+    dbg_print("[ESP TCP PERSIST] CIPSTART FAILED\r\n");
+    esp_tcp_persistent_connected = false;
+    return false;
+}
+
+/* Persistent send: assumes an open persistent connection. Will attempt to auto-reopen once. */
+bool esp_tcp_send_persistent(const uint8_t *data, uint16_t len, uint32_t timeout_ms)
+{
+    if (!data || len == 0) return false;
+
+    if (!esp_tcp_persistent_connected) {
+        dbg_print("[ESP TCP PERSIST] not connected → attempting open to %s:%d\r\n", esp_tcp_ip[0]?esp_tcp_ip:"<unknown>", esp_tcp_port);
+        if (!esp_tcp_open_persistent(esp_tcp_ip, esp_tcp_port, timeout_ms)) {
+            dbg_print("[ESP TCP PERSIST] open failed, cannot send\r\n");
+            return false;
+        }
+    }
+
+    /* CIPSEND as usual */
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%u\r\n", len);
+
+    dbg_print("[ESP TCP PERSIST] CIPSEND %u\r\n", len);
+    if (!esp_send_raw(cmd, 2000)) {
+        dbg_print("[ESP TCP PERSIST] TX fail for CIPSEND cmd\r\n");
+        esp_tcp_persistent_connected = false;
+        return false;
+    }
+
+    /* wait for > prompt */
+    char resp[512];
+    int got = esp_read_resp(resp, sizeof(resp), ESP_PROMPT_TIMEOUT, 200);
+
+    dbg_print("[ESP RAW] %s\r\n", resp);
+
+    if (got <= 0 || !strstr(resp, ">")) {
+        dbg_print("[ESP TCP PERSIST] No prompt or unexpected response\r\n");
+        /* try to see if link invalid or connection closed; close & mark not connected */
+        if (strstr(resp, "link is not valid") || strstr(resp, "ERROR") || strstr(resp, "CLOSED")) {
+            dbg_print("[ESP TCP PERSIST] link invalid/closed -> cleaning up\r\n");
+            esp_send_cmd_expect_print("AT+CIPCLOSE\r\n", "CLOSED", 2000);
+        }
+        esp_tcp_persistent_connected = false;
+        return false;
+    }
+
+    /* small prompt delay */
+    HAL_Delay(ESP_PROMPT_DELAY_MS);
+
+    HAL_StatusTypeDef tx = HAL_UART_Transmit(&ESP_UART_HANDLE, (uint8_t*)data, len, ESP_SEND_TIMEOUT);
+    if (tx != HAL_OK) {
+        dbg_print("[ESP TCP PERSIST] payload TX error %d\r\n", tx);
+        esp_tcp_persistent_connected = false;
+        esp_soft_recover();
+        return false;
+    }
+
+    /* wait for SEND OK */
+    got = esp_read_resp(resp, sizeof(resp), timeout_ms, 250);
+    dbg_print("[ESP RAW] %s\r\n", resp);
+
+    if (got > 0 && strstr(resp, "SEND OK")) {
+        dbg_print("[ESP TCP PERSIST] SEND OK\r\n");
+        return true;
+    }
+
+    dbg_print("[ESP TCP PERSIST] SEND FAIL -> will reset persistent flag\r\n");
+    esp_tcp_persistent_connected = false;
+    esp_soft_recover();
+    return false;
+}
+
+/* Close persistent connection (public) */
+void esp_tcp_close_persistent(uint32_t timeout_ms)
+{
+    dbg_print("[ESP TCP PERSIST] Closing persistent connection\r\n");
+    esp_send_cmd_expect_print("AT+CIPCLOSE\r\n", "CLOSED", timeout_ms);
+    esp_tcp_persistent_connected = false;
+    esp_tcp_ip[0] = 0;
+    esp_tcp_port = 0;
+}
+
