@@ -1,0 +1,867 @@
+fftutils.c file-- 
+#ifndef FFT_UTILS_H
+#define FFT_UTILS_H
+
+#include "arm_math.h"   // CMSIS DSP
+#include <stdint.h>
+
+/* -------------------------------------------------------------------
+ *  FFT configuration parameters
+ * ------------------------------------------------------------------- */
+#define FFT_LEN           64
+#define MAX_KEEP_BINS     8
+#define ENERGY_THRESHOLD  0.90f
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * @brief Perform FFT-based pruning / compression of PCA scores.
+ *
+ * @param scores: Input float array (time-domain signal or PCA scores)
+ * @param len: Length of the input (≤ FFT_LEN)
+ * @param qre_out: Quantized real bins output (int16_t)
+ * @param qim_out: Quantized imaginary bins output (int16_t)
+ * @param kept_bins: Array of indices of kept bins
+ * @param n_kept: Number of bins actually kept
+ * @param total_bins: Total bins considered
+ * @param energy_kept: Fraction of total energy preserved (0–1)
+ *
+ * @return int 0 = OK, negative on error
+ */
+int fft_prune(const float *scores, int len,
+              int16_t *qre_out, int16_t *qim_out,
+              int *kept_bins, int *n_kept,
+              int *total_bins, float *energy_kept);
+
+/**
+ * @brief Run full FFT compression + quantization + inverse reconstruction.
+ */
+void run_fft_compress(float *input, int len);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* FFT_UTILS_H */
+
+
+//#ifndef FFT_UTILS_H__
+//#define FFT_UTILS_H__
+//
+//#include <stdint.h>
+//
+///*
+// * fft_prune
+// *
+// * Inputs:
+// *   scores[len]         - real-valued principal component scores (len = sample_count)
+// *   len                 - number of valid samples (<= BATCH_M)
+// *
+// * Outputs:
+// *   kept_bins[out_n]    - indices of kept frequency bins (0..FFT_LEN-1)
+// *   out_n               - pointer to int, number of kept bins returned
+// *   out_qre[out_n]      - quantized real parts (int16) for each kept bin
+// *   out_qim[out_n]      - quantized imag parts (int16) for each kept bin
+// *   out_qbytes          - pointer to int, number of bytes required to store quantized bins (filled)
+// *   out_recon_mse       - pointer to float, MSE between reconstructed PC (first len samples) and original scores
+// *
+// * Returns 0 on success, <0 on failure.
+// *
+// * Notes:
+// *  - Implementation currently uses an O(N^2) direct DFT for portability.
+// *  - FFT_LEN is fixed to 64 (power-of-two >= typical BATCH_M=60). You may change FFT_LEN if needed.
+// */
+//int fft_prune(const float *scores, int len,
+//              int16_t *out_qre, int16_t *out_qim, int *kept_bins, int *out_n,
+//              int *out_qbytes, float *out_recon_mse);
+//
+//#endif /* FFT_UTILS_H__ */
+
+
+#include "fft_utils.h"
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include "main.h"   // contains N_VARS definition
+
+/* Tunable parameters */
+#ifndef FFT_LEN
+#define FFT_LEN 64           /* next power-of-two >= BATCH_M (60) */
+#endif
+#ifndef ENERGY_THRESHOLD
+#define ENERGY_THRESHOLD 0.90f
+#endif
+#ifndef MAX_KEEP_BINS
+#define MAX_KEEP_BINS 8
+#endif
+#define N_VARS 6
+
+/* Internal complex number helpers (float) */
+typedef struct { float re, im; } cplx;
+
+/* Simple DFT (forward): input real[] length N -> output complex[] length N */
+static void dft_forward_real(const float *real_in, int N, cplx *out)
+{
+    for (int k = 0; k < N; ++k) {
+        float acc_re = 0.0f;
+        float acc_im = 0.0f;
+        for (int n = 0; n < N; ++n) {
+            float angle = -2.0f * (float)M_PI * (float)k * (float)n / (float)N;
+            float cr = cosf(angle);
+            float ci = sinf(angle);
+            acc_re += real_in[n] * cr;
+            acc_im += real_in[n] * ci;
+        }
+        out[k].re = acc_re;
+        out[k].im = acc_im;
+    }
+}
+
+/* Inverse DFT from complex spectrum (length N) -> real_out (length N) */
+static void dft_inverse_real(const cplx *spec, int N, float *real_out)
+{
+    for (int n = 0; n < N; ++n) {
+        float acc = 0.0f;
+        for (int k = 0; k < N; ++k) {
+            float angle = 2.0f * (float)M_PI * (float)k * (float)n / (float)N;
+            acc += spec[k].re * cosf(angle) - spec[k].im * sinf(angle);
+        }
+        real_out[n] = acc / (float)N;
+    }
+}
+
+/* Helper: absolute-squared (energy) of complex number */
+static inline float cplx_energy(const cplx *c) { return c->re * c->re + c->im * c->im; }
+
+/* Simple selection of top bins by energy (returns indices in descending order) */
+static void select_top_bins(const float *energies, int N, int max_bins, int *out_idx, int *out_count, float energy_threshold)
+{
+    /* copy energies into a local array of (value, index) pairs */
+    typedef struct { float e; int idx; } pair;
+    pair *arr = (pair *)malloc(sizeof(pair) * N);
+    for (int i = 0; i < N; ++i) { arr[i].e = energies[i]; arr[i].idx = i; }
+
+    /* sort descending by energy (simple selection sort since N small) */
+    for (int i = 0; i < N - 1; ++i) {
+        int m = i;
+        for (int j = i + 1; j < N; ++j) if (arr[j].e > arr[m].e) m = j;
+        if (m != i) { pair tmp = arr[i]; arr[i] = arr[m]; arr[m] = tmp; }
+    }
+
+    /* choose bins until energy threshold met or max_bins reached */
+    float total = 0.0f;
+    for (int i = 0; i < N; ++i) total += arr[i].e;
+    float cum = 0.0f;
+    int chosen = 0;
+    for (int i = 0; i < N && chosen < max_bins; ++i) {
+        cum += arr[i].e;
+        out_idx[chosen++] = arr[i].idx;
+        if (total > 0.0f && (cum / total) >= energy_threshold) break;
+    }
+    *out_count = chosen;
+    free(arr);
+}
+
+/* Quantize kept bins (real+imag) to int16 using symmetric scaling */
+static int quantize_bins(const cplx *spec, const int *bins, int nbins, int16_t *out_qre, int16_t *out_qim, float *scale_out)
+{
+    float max_abs = 0.0f;
+    for (int i = 0; i < nbins; ++i) {
+        int idx = bins[i];
+        float a = fabsf(spec[idx].re);
+        float b = fabsf(spec[idx].im);
+        if (a > max_abs) max_abs = a;
+        if (b > max_abs) max_abs = b;
+    }
+    if (max_abs < 1e-9f) max_abs = 1.0f; /* avoid div by zero */
+
+    /* scale so that max_abs maps to int16 max */
+    float scale = max_abs / 32767.0f;
+    for (int i = 0; i < nbins; ++i) {
+        int idx = bins[i];
+        int32_t qre = (int32_t)roundf(spec[idx].re / scale);
+        int32_t qim = (int32_t)roundf(spec[idx].im / scale);
+        if (qre > 32767) qre = 32767; if (qre < -32768) qre = -32768;
+        if (qim > 32767) qim = 32767; if (qim < -32768) qim = -32768;
+        out_qre[i] = (int16_t)qre;
+        out_qim[i] = (int16_t)qim;
+    }
+    if (scale_out) *scale_out = scale;
+    return 0;
+}
+
+/* Unquantize bins into complex spectrum copy (spec_out) using scale */
+static void unquantize_bins_into_spec(cplx *spec_out, const int *bins, int nbins, const int16_t *qre, const int16_t *qim, float scale)
+{
+    /* ensure spec_out is zeroed by caller */
+    for (int i = 0; i < nbins; ++i) {
+        int idx = bins[i];
+        spec_out[idx].re = ((float)qre[i]) * scale;
+        spec_out[idx].im = ((float)qim[i]) * scale;
+    }
+}
+
+/* Public function */
+int fft_prune(const float *scores, int len,
+              int16_t *out_qre, int16_t *out_qim, int *kept_bins, int *out_n,
+              int *out_qbytes, float *out_recon_mse)
+{
+    if (!scores || !kept_bins || !out_n || !out_qbytes || !out_recon_mse) return -1;
+    if (len <= 0 || len > FFT_LEN) return -2;
+
+    /* build real input of length FFT_LEN (zero padded) */
+    float real_in[FFT_LEN];
+    for (int i = 0; i < FFT_LEN; ++i) real_in[i] = 0.0f;
+    for (int i = 0; i < len; ++i) real_in[i] = scores[i];
+
+    /* forward DFT -> spec[0..FFT_LEN-1] */
+    cplx spec[FFT_LEN];
+    dft_forward_real(real_in, FFT_LEN, spec);
+
+    /* compute energies */
+    float energies[FFT_LEN];
+    float total_energy = 0.0f;
+    for (int k = 0; k < FFT_LEN; ++k) {
+        energies[k] = cplx_energy(&spec[k]);
+        total_energy += energies[k];
+    }
+
+    /* select top bins */
+    int sel_idx[FFT_LEN];
+    int sel_count = 0;
+    select_top_bins(energies, FFT_LEN, MAX_KEEP_BINS, sel_idx, &sel_count, ENERGY_THRESHOLD);
+
+    /* ensure conjugate pairs included for real signal (keep k and N-k) */
+    /* Build a small unique set including conjugates */
+    int uniq[FFT_LEN];
+    int uniq_count = 0;
+    for (int i = 0; i < sel_count; ++i) {
+        int k = sel_idx[i];
+        /* include k */
+        int found = 0;
+        for (int t = 0; t < uniq_count; ++t) if (uniq[t] == k) { found = 1; break; }
+        if (!found) uniq[uniq_count++] = k;
+        /* include conjugate N-k (if not equal and not already present) */
+        int kc = (k == 0) ? 0 : (FFT_LEN - k);
+        if (kc != k) {
+            found = 0;
+            for (int t = 0; t < uniq_count; ++t) if (uniq[t] == kc) { found = 1; break; }
+            if (!found) uniq[uniq_count++] = kc;
+        }
+    }
+
+    /* limit uniq_count to MAX_KEEP_BINS (if exceeded, truncate) */
+    if (uniq_count > MAX_KEEP_BINS) uniq_count = MAX_KEEP_BINS;
+
+    /* sort uniq ascending (for consistent printing) */
+    for (int i = 0; i < uniq_count - 1; ++i) {
+        int m = i;
+        for (int j = i + 1; j < uniq_count; ++j) if (uniq[j] < uniq[m]) m = j;
+        if (m != i) { int t = uniq[i]; uniq[i] = uniq[m]; uniq[m] = t; }
+    }
+
+    /* quantize selected bins */
+    float scale = 1.0f;
+    quantize_bins(spec, uniq, uniq_count, out_qre, out_qim, &scale);
+
+    /* compute quantized bytes: for each kept bin we store index (1 byte) + qre(2 bytes) + qim(2 bytes)
+       index size assumed 1 byte (enough for FFT_LEN=64). Adjust if larger. */
+    int bytes_for_bins = uniq_count * (1 + 2 + 2); /* idx + re + im */
+    int bytes_means = (N_VARS * 4); /* means as float32 */
+    int bytes_eigvec = (N_VARS * 4);
+    int total_bytes = bytes_means + bytes_eigvec + bytes_for_bins;
+
+    /* reconstruct spectrum from quantized bins */
+    cplx spec_pruned[FFT_LEN];
+    for (int i = 0; i < FFT_LEN; ++i) { spec_pruned[i].re = 0.0f; spec_pruned[i].im = 0.0f; }
+    unquantize_bins_into_spec(spec_pruned, uniq, uniq_count, out_qre, out_qim, scale);
+
+    /* inverse DFT to obtain reconstructed time-domain of length FFT_LEN */
+    float recon_full[FFT_LEN];
+    dft_inverse_real(spec_pruned, FFT_LEN, recon_full);
+
+    /* compute MSE between first 'len' samples of recon_full and original scores */
+    double sse = 0.0;
+    for (int i = 0; i < len; ++i) {
+        double d = (double)scores[i] - (double)recon_full[i];
+        sse += d * d;
+    }
+    double denom = (double)len;
+    float recon_mse = (denom > 0.0) ? (float)(sse / denom) : 0.0f;
+
+    /* copy uniq into kept_bins out (as int) and set out_n */
+    for (int i = 0; i < uniq_count; ++i) kept_bins[i] = uniq[i];
+    *out_n = uniq_count;
+    *out_qbytes = total_bytes;
+    *out_recon_mse = recon_mse;
+
+    return 0;
+}
+
+
+
+
+PCA_PRUNE.C FILE 
+
+
+/* Core/Src/pca_prune.c  (production-ready serialization + CRC16-MODBUS)
+ *
+ * - Safe little-endian writers (no unaligned pointer casts)
+ * - "PCAP" magic + version + seq + payload_len header
+ * - Original payload body preserved (sample_count, N_VARS, timestamp, means, eigvec, kept_n, kept_idx, qre, qim)
+ * - CRC16-MODBUS (0xA001) appended (LE)
+ *
+ * NOTE: update HES parser to:
+ *   - read 4 byte magic "PCAP"
+ *   - read uint8_t version (we use 2)
+ *   - read uint16_t seq (LE)
+ *   - read uint16_t payload_len (LE) -> this is length of the body that follows (not including CRC)
+ *   - read 'payload_len' bytes (the old body format)
+ *   - read final uint16_t CRC16 (LE) and verify over (magic+ver+seq+payload_len+body)
+ *
+ * Versioning lets you extend the protocol later.
+ */
+
+#include "pca_prune.h"
+#include "fft_utils.h"
+#include <string.h>
+#include <stdio.h>
+#include <math.h>
+#include <stdint.h>
+
+#include "usart.h"
+extern UART_HandleTypeDef huart3;
+extern void dbg_print(const char *fmt, ...);
+
+#ifndef PCA_DEBUG_LEVEL
+#define PCA_DEBUG_LEVEL 1
+#endif
+
+/* params from header */
+#ifndef BATCH_M
+#error "BATCH_M must be defined"
+#endif
+#ifndef N_VARS
+#error "N_VARS must be defined"
+#endif
+#ifndef MAX_KEEP_BINS
+#error "MAX_KEEP_BINS must be defined"
+#endif
+
+/* internal data */
+static float data_buf[BATCH_M][N_VARS];
+static int sample_count = 0;
+
+/* start timestamp storage */
+static uint8_t start_year_off = 0;
+static uint8_t start_month = 0;
+static uint8_t start_day = 0;
+static uint8_t start_hour = 0;
+static uint8_t start_min = 0;
+static uint8_t start_sec = 0;
+static uint16_t start_period_ms = 0;
+static int start_ts_set = 0;
+
+/* serialized buffer */
+#define SER_BUF_MAX 512
+static uint8_t ser_buf[SER_BUF_MAX];
+static uint16_t ser_len = 0;
+
+/* sequence number for packets */
+static uint16_t ser_seq = 0;
+
+/* helpers: CRC16-MODBUS (poly 0xA001) */
+static uint16_t crc16_modbus_buf(const uint8_t *data, size_t len)
+{
+    uint16_t crc = 0xFFFF;
+    for (size_t pos = 0; pos < len; pos++) {
+        crc ^= data[pos];
+        for (uint8_t i = 0; i < 8; i++) {
+            if (crc & 1) crc = (crc >> 1) ^ 0xA001;
+            else crc >>= 1;
+        }
+    }
+    return crc;
+}
+
+/* safe writers */
+typedef struct {
+    uint8_t *p;
+    int rem;
+} wr_ctx_t;
+
+static void wr_init(wr_ctx_t *w, uint8_t *buf, int buflen) {
+    w->p = buf;
+    w->rem = buflen;
+}
+static int wr_bytes_left(wr_ctx_t *w) { return w->rem; }
+
+static int wr_u8(wr_ctx_t *w, uint8_t v) {
+    if (w->rem < 1) return -1;
+    *w->p++ = v; w->rem -= 1; return 0;
+}
+static int wr_u16_le(wr_ctx_t *w, uint16_t v) {
+    if (w->rem < 2) return -1;
+    *w->p++ = (uint8_t)(v & 0xFF);
+    *w->p++ = (uint8_t)((v >> 8) & 0xFF);
+    w->rem -= 2; return 0;
+}
+static int wr_i16_le(wr_ctx_t *w, int16_t v) {
+    return wr_u16_le(w, (uint16_t)v);
+}
+static int wr_u32_le(wr_ctx_t *w, uint32_t v) {
+    if (w->rem < 4) return -1;
+    *w->p++ = (uint8_t)(v & 0xFF);
+    *w->p++ = (uint8_t)((v >> 8) & 0xFF);
+    *w->p++ = (uint8_t)((v >> 16) & 0xFF);
+    *w->p++ = (uint8_t)((v >> 24) & 0xFF);
+    w->rem -= 4; return 0;
+}
+static int wr_f32_le(wr_ctx_t *w, float f) {
+    union { float f; uint32_t u; } u;
+    u.f = f;
+    return wr_u32_le(w, u.u);
+}
+static int wr_mem(wr_ctx_t *w, const void *src, int len) {
+    if (w->rem < len) return -1;
+    memcpy(w->p, src, len);
+    w->p += len; w->rem -= len; return 0;
+}
+
+/* helper to reset batch */
+static void zero_buf(void) {
+    memset(data_buf, 0, sizeof(data_buf));
+    sample_count = 0;
+    /* note: start_ts_set kept as-is; caller sets/clears as needed */
+}
+
+/* setter for timestamp */
+void pca_prune_set_start_timestamp(uint8_t year_off, uint8_t month, uint8_t day,
+                                   uint8_t hour, uint8_t min, uint8_t sec,
+                                   uint16_t period_ms)
+{
+    start_year_off = year_off;
+    start_month = month;
+    start_day = day;
+    start_hour = hour;
+    start_min = min;
+    start_sec = sec;
+    start_period_ms = period_ms;
+    start_ts_set = 1;
+#if PCA_DEBUG_LEVEL >= 1
+    dbg_print("[PCA] start timestamp set: 20%02u-%02u-%02u %02u:%02u:%02u period_ms=%u\r\n",
+              (unsigned)start_year_off, (unsigned)start_month, (unsigned)start_day,
+              (unsigned)start_hour, (unsigned)start_min, (unsigned)start_sec,
+              (unsigned)start_period_ms);
+#endif
+}
+
+int pca_prune_get_current_sample_count(void)
+{
+    return sample_count;
+}
+
+void pca_prune_init(void) {
+    zero_buf();
+#if PCA_DEBUG_LEVEL >= 1
+    dbg_print("[PCA] pca_prune_init: BATCH_M=%d N_VARS=%d\r\n", BATCH_M, N_VARS);
+#endif
+}
+
+void pca_prune_feed_sample(const float sample[N_VARS]) {
+    if (sample == NULL) return;
+    if (sample_count < BATCH_M) {
+        for (int j = 0; j < N_VARS; ++j) data_buf[sample_count][j] = sample[j];
+        sample_count++;
+#if PCA_DEBUG_LEVEL >= 2
+        dbg_print("[PCA] fed sample #%d: [", sample_count);
+        for (int j = 0; j < N_VARS; ++j) dbg_print("%.3f%s", sample[j], (j+1==N_VARS) ? "" : ", ");
+        dbg_print("]\r\n");
+#endif
+    } else {
+        memmove(&data_buf[0], &data_buf[1], sizeof(float) * N_VARS * (BATCH_M - 1));
+        for (int j = 0; j < N_VARS; ++j) data_buf[BATCH_M - 1][j] = sample[j];
+#if PCA_DEBUG_LEVEL >= 2
+        dbg_print("[PCA] buffer full -> rolling, still count=%d\r\n", sample_count);
+#endif
+    }
+}
+
+/* compute means */
+static void compute_means(float means[N_VARS]) {
+    for (int j = 0; j < N_VARS; ++j) means[j] = 0.0f;
+    if (sample_count <= 0) return;
+    for (int i = 0; i < sample_count; ++i)
+        for (int j = 0; j < N_VARS; ++j)
+            means[j] += data_buf[i][j];
+    float inv = 1.0f / (float)sample_count;
+    for (int j = 0; j < N_VARS; ++j) means[j] *= inv;
+}
+
+/* compute covariance */
+static void compute_covariance(const float means[N_VARS], float cov[N_VARS][N_VARS]) {
+    for (int i = 0; i < N_VARS; ++i)
+        for (int j = 0; j < N_VARS; ++j)
+            cov[i][j] = 0.0f;
+    if (sample_count < 2) return;
+    for (int t = 0; t < sample_count; ++t) {
+        for (int i = 0; i < N_VARS; ++i) {
+            float a = data_buf[t][i] - means[i];
+            for (int j = 0; j < N_VARS; ++j) {
+                float b = data_buf[t][j] - means[j];
+                cov[i][j] += a * b;
+            }
+        }
+    }
+    float denom = 1.0f / (float)(sample_count - 1);
+    for (int i = 0; i < N_VARS; ++i)
+        for (int j = 0; j < N_VARS; ++j)
+            cov[i][j] *= denom;
+}
+
+/* power iteration top-1 */
+static void power_iteration_top1(const float cov[N_VARS][N_VARS], float eig[N_VARS]) {
+    for (int i = 0; i < N_VARS; ++i) eig[i] = 1.0f;
+    {
+        float s = 0.0f;
+        for (int i = 0; i < N_VARS; ++i) s += eig[i]*eig[i];
+        s = sqrtf(s); if (s <= 1e-12f) s = 1.0f;
+        for (int i = 0; i < N_VARS; ++i) eig[i] /= s;
+    }
+    for (int it = 0; it < 100; ++it) {
+        float y[N_VARS];
+        for (int i = 0; i < N_VARS; ++i) { y[i] = 0.0f; for (int j = 0; j < N_VARS; ++j) y[i] += cov[i][j] * eig[j]; }
+        float norm = 0.0f;
+        for (int i = 0; i < N_VARS; ++i) norm += y[i]*y[i];
+        if (norm <= 1e-20f) break;
+        norm = sqrtf(norm);
+        float diff = 0.0f;
+        for (int i = 0; i < N_VARS; ++i) {
+            float v = y[i]/norm;
+            float d = v - eig[i];
+            diff += d*d;
+            eig[i] = v;
+        }
+        if (diff < 1e-12f) break;
+    }
+}
+
+static void project_scores(const float means[N_VARS], const float eig[N_VARS], float scores[BATCH_M]) {
+    for (int t = 0; t < sample_count; ++t) {
+        float s = 0.0f;
+        for (int j = 0; j < N_VARS; ++j) s += (data_buf[t][j] - means[j]) * eig[j];
+        scores[t] = s;
+    }
+}
+
+static void reconstruct_from_scores(const float means[N_VARS], const float eig[N_VARS], const float scores[BATCH_M], float recon[BATCH_M][N_VARS]) {
+    for (int t = 0; t < sample_count; ++t)
+        for (int j = 0; j < N_VARS; ++j)
+            recon[t][j] = means[j] + scores[t] * eig[j];
+}
+
+static float compute_mse_internal(const float recon[BATCH_M][N_VARS]) {
+    double sse = 0.0;
+    for (int t = 0; t < sample_count; ++t)
+        for (int j = 0; j < N_VARS; ++j) {
+            double d = (double)data_buf[t][j] - (double)recon[t][j];
+            sse += d * d;
+        }
+    double denom = (double)sample_count * (double)N_VARS;
+    if (denom <= 0.0) return 0.0f;
+    return (float)(sse / denom);
+}
+
+static float compute_total_variance(const float means[N_VARS]) {
+    double s = 0.0;
+    for (int t = 0; t < sample_count; ++t)
+        for (int j = 0; j < N_VARS; ++j) {
+            double d = (double)data_buf[t][j] - (double)means[j];
+            s += d*d;
+        }
+    double denom = (double)sample_count * (double)N_VARS;
+    if (denom <= 0.0) return 0.0f;
+    return (float)(s / denom);
+}
+
+/* main run function */
+int pca_prune_maybe_run_and_report(void) {
+    static uint32_t last_run_ms = 0;
+    uint32_t now_ms = HAL_GetTick();
+
+#if PCA_DEBUG_LEVEL >= 2
+    dbg_print("[PCA] maybe_run called: sample_count=%d last_run=%lu now=%lu elapsed=%lu\r\n",
+              sample_count, (unsigned long)last_run_ms, (unsigned long)now_ms, (unsigned long)(now_ms - last_run_ms));
+#endif
+
+    if (sample_count < BATCH_M && (now_ms - last_run_ms) < 60000UL) {
+#if PCA_DEBUG_LEVEL >= 1
+        dbg_print("[PCA] Not running: sample_count=%d elapsed=%lums (need %d or 60000ms)\r\n",
+                  sample_count, (unsigned long)(now_ms - last_run_ms), BATCH_M);
+#endif
+        return 0;
+    }
+    if (sample_count < 4) {
+#if PCA_DEBUG_LEVEL >= 1
+        dbg_print("[PCA] Not enough samples to run PCA (have %d)\r_print");
+#endif
+        return 0;
+    }
+
+#if PCA_DEBUG_LEVEL >= 1
+    dbg_print("[PCA] Running PCA with %d samples (forced by timer/full)\r\n", sample_count);
+#endif
+
+    /* 1) Means */
+    float means[N_VARS];
+    compute_means(means);
+
+    /* 2) Covariance */
+    float cov[N_VARS][N_VARS];
+    compute_covariance(means, cov);
+
+    /* 3) Top-1 eigvec */
+    float eigvec[N_VARS];
+    power_iteration_top1(cov, eigvec);
+
+    /* 4) Project -> scores */
+    float scores[BATCH_M];
+    project_scores(means, eigvec, scores);
+
+    /* 5) Reconstruct & MSE */
+    float recon[BATCH_M][N_VARS];
+    reconstruct_from_scores(means, eigvec, scores, recon);
+    float mse = compute_mse_internal(recon);
+
+    /* 6) total variance and savings estimate */
+    float tot_var = compute_total_variance(means);
+    float savings_pct = 0.0f;
+    if (tot_var > 1e-12f) savings_pct = (1.0f - (mse / tot_var)) * 100.0f;
+    if (savings_pct < 0.0f) savings_pct = 0.0f;
+
+#if PCA_DEBUG_LEVEL >= 2
+    dbg_print("\r\n=== PCA PRUNE REPORT ===\r\n");
+    dbg_print("Samples: %d  N_VARS: %d  BATCH_M: %d\r\n", sample_count, N_VARS, BATCH_M);
+    dbg_print("eigvec: ");
+    for (int j = 0; j < N_VARS; ++j) dbg_print("%.4f ", eigvec[j]);
+    dbg_print("\r\n");
+    dbg_print("means:  ");
+    for (int j = 0; j < N_VARS; ++j) dbg_print("%.3f ", means[j]);
+    dbg_print("\r\n");
+    dbg_print("MSE=%.6f  TotVar=%.6f  EstimatedSavings=%.2f%%\r\n",
+              mse, tot_var, savings_pct);
+#endif
+
+    /* FFT prune */
+    int kept_n_final = 0;
+    int qbytes_final = 0;
+    {
+        int16_t qre[MAX_KEEP_BINS];
+        int16_t qim[MAX_KEEP_BINS];
+        int kept_idx[MAX_KEEP_BINS];
+        int kept_n = 0;
+        int qbytes = 0;
+        float recon_m = 0.0f;
+
+        int rc = fft_prune(scores, sample_count,
+                           qre, qim, kept_idx, &kept_n,
+                           &qbytes, &recon_m);
+
+        if (rc == 0) {
+#if PCA_DEBUG_LEVEL >= 2
+            dbg_print("\r\n--- FFT PRUNE (scores) ---\r\n");
+            dbg_print("Kept bins: %d  QuantBytes=%d  ReconMSE=%.6f\r\n", kept_n, qbytes, recon_m);
+            dbg_print("Indices: ");
+            for (int i = 0; i < kept_n; ++i) dbg_print("%d ", kept_idx[i]);
+            dbg_print("\r\nQuantized (re,im): ");
+            for (int i = 0; i < kept_n; ++i) dbg_print("%d,%d ", (int)qre[i], (int)qim[i]);
+            dbg_print("\r\n");
+#endif
+            kept_n_final = kept_n;
+            qbytes_final = qbytes;
+            float raw_bytes = (float)sample_count * N_VARS * sizeof(float);
+            int bytes_means = N_VARS * 4;
+            int bytes_eigvec = N_VARS * 4;
+            int bytes_timestamp = 8;
+            int total_bytes = bytes_means + bytes_eigvec + qbytes + bytes_timestamp + 2 + (2*kept_n); /* approx */
+            float real_saved = 100.0f * (1.0f - ((float)total_bytes / raw_bytes));
+            dbg_print("Bytes: raw=%d compressed(est)=%d saved=%.2f%%\r\n", (int)raw_bytes, total_bytes, real_saved);
+        } else {
+#if PCA_DEBUG_LEVEL >= 1
+            dbg_print("[PCA] fft_prune failed rc=%d\r\n", rc);
+#endif
+            ser_len = 0;
+            zero_buf();
+            last_run_ms = now_ms;
+            return 1;
+        }
+    }
+
+    /* === SERIALIZE ===
+     * New packet layout (versioned):
+     *  [4] "PCAP"
+     *  [1] version (uint8) = 2
+     *  [2] seq (uint16 LE)
+     *  [2] payload_len (uint16 LE)  -- length of body (everything after this field, excluding final CRC)
+     *  [payload_len bytes] body:
+     *    body keeps the old structure:
+     *      [2] sample_count (uint16 LE)
+     *      [1] N_VARS (uint8)
+     *      [8] timestamp: year_off, month, day, hour, min, sec, period_ms (uint16 LE)
+     *      [4*N_VARS] means (float LE)
+     *      [4*N_VARS] eigvec (float LE)
+     *      [2] kept_n (uint16 LE)
+     *      [2*kept_n] kept_idx (uint16 LE)
+     *      [2*kept_n] qre (int16 LE)
+     *      [2*kept_n] qim (int16 LE)
+     *  [2] CRC16-MODBUS (uint16 LE) computed over everything before the CRC (magic+ver+seq+payload_len+body)
+     *
+     * Note: HES must validate CRC before parsing.
+     */
+
+    wr_ctx_t w;
+    wr_init(&w, ser_buf, SER_BUF_MAX);
+
+    /* header */
+    if (wr_mem(&w, "PCAP", 4) < 0) { dbg_print("[PCA] ser buf overflow (magic)\r\n"); ser_len = 0; goto done; }
+    if (wr_u8(&w, 2) < 0) { dbg_print("[PCA] ser buf overflow (ver)\r\n"); ser_len = 0; goto done; } /* version */
+
+    /* seq (we will write placeholder now, and fill via direct write) */
+    uint16_t seq_here = ser_seq++;
+    if (wr_u16_le(&w, seq_here) < 0) { dbg_print("[PCA] ser buf overflow (seq)\r\n"); ser_len = 0; goto done; }
+
+    /* reserve payload_len placeholder */
+    uint8_t *payload_len_ptr = w.p;
+    if (wr_u16_le(&w, 0) < 0) { dbg_print("[PCA] ser buf overflow (payload_len)\r\n"); ser_len = 0; goto done; }
+
+    /* start body marker: remember start */
+    uint8_t *body_start = w.p;
+
+    /* sample_count */
+    if (wr_u16_le(&w, (uint16_t)sample_count) < 0) { dbg_print("[PCA] ser buf overflow (sample_count)\r\n"); ser_len = 0; goto done; }
+
+    /* N_VARS */
+    if (wr_u8(&w, (uint8_t)N_VARS) < 0) { dbg_print("[PCA] ser buf overflow (nvars)\r\n"); ser_len = 0; goto done; }
+
+    /* timestamp 8 bytes (always write 8 bytes; zeros if not set) */
+    if (wr_u8(&w, start_year_off) < 0) { ser_len = 0; goto done; }
+    if (wr_u8(&w, start_month) < 0) { ser_len = 0; goto done; }
+    if (wr_u8(&w, start_day) < 0) { ser_len = 0; goto done; }
+    if (wr_u8(&w, start_hour) < 0) { ser_len = 0; goto done; }
+    if (wr_u8(&w, start_min) < 0) { ser_len = 0; goto done; }
+    if (wr_u8(&w, start_sec) < 0) { ser_len = 0; goto done; }
+    if (wr_u16_le(&w, start_period_ms) < 0) { ser_len = 0; goto done; }
+
+    /* means */
+    for (int j = 0; j < N_VARS; ++j) {
+        if (wr_f32_le(&w, means[j]) < 0) { ser_len = 0; goto done; }
+    }
+
+    /* eigvec */
+    for (int j = 0; j < N_VARS; ++j) {
+        if (wr_f32_le(&w, eigvec[j]) < 0) { ser_len = 0; goto done; }
+    }
+
+    /* re-run fft_prune to retrieve kept arrays for serialization */
+    {
+        int16_t qre_tmp[MAX_KEEP_BINS];
+        int16_t qim_tmp[MAX_KEEP_BINS];
+        int kept_idx_tmp[MAX_KEEP_BINS];
+        int kept_n_tmp = 0;
+        int qbytes_tmp = 0;
+        float recon_mse_tmp = 0.0f;
+        int rc2 = fft_prune(scores, sample_count,
+                            qre_tmp, qim_tmp, kept_idx_tmp, &kept_n_tmp,
+                            &qbytes_tmp, &recon_mse_tmp);
+        if (rc2 != 0) {
+            dbg_print("[PCA] fft_prune (second pass) failed rc=%d\r\n", rc2);
+            ser_len = 0;
+            goto done;
+        }
+
+        /* kept_n */
+        if (wr_u16_le(&w, (uint16_t)kept_n_tmp) < 0) { ser_len = 0; goto done; }
+
+        /* Cap kept_n_tmp to MAX_KEEP_BINS and sample_count */
+        if (kept_n_tmp > MAX_KEEP_BINS) {
+            dbg_print("[PCA][WARN] kept_n overflow (%d). Capped to %d.\r\n",
+                      kept_n_tmp, MAX_KEEP_BINS);
+            kept_n_tmp = MAX_KEEP_BINS;
+        }
+        if (kept_n_tmp > sample_count) {
+            dbg_print("[PCA][WARN] kept_n > sample_count (%d > %d). Capped.\r\n",
+                      kept_n_tmp, sample_count);
+            kept_n_tmp = sample_count;
+        }
+
+
+        /* kept_idx WITH VALIDATION & CLAMP */
+        for (int i = 0; i < kept_n_tmp; ++i) {
+
+            uint16_t k = (uint16_t)kept_idx_tmp[i];
+
+            /* SAFETY: clamp invalid bins */
+            if (k >= sample_count) {
+                dbg_print("[PCA][WARN] Invalid bin %u (max %d). Clamped.\r\n",
+                          k, sample_count - 1);
+                k = (uint16_t)(sample_count - 1);
+            }
+
+            if (wr_u16_le(&w, k) < 0) { ser_len = 0; goto done; }
+        }
+
+        /* qre */
+        for (int i = 0; i < kept_n_tmp; ++i) {
+            if (wr_i16_le(&w, (int16_t)qre_tmp[i]) < 0) { ser_len = 0; goto done; }
+        }
+        /* qim */
+        for (int i = 0; i < kept_n_tmp; ++i) {
+            if (wr_i16_le(&w, (int16_t)qim_tmp[i]) < 0) { ser_len = 0; goto done; }
+        }
+        kept_n_final = kept_n_tmp;
+    }
+
+    /* compute payload_len = bytes from body_start to current p (exclusive) */
+    {
+        uint16_t payload_len = (uint16_t)(w.p - body_start);
+        /* write little-endian into the placeholder */
+        payload_len_ptr[0] = (uint8_t)(payload_len & 0xFF);
+        payload_len_ptr[1] = (uint8_t)((payload_len >> 8) & 0xFF);
+    }
+
+    /* compute CRC over everything from ser_buf start up to here (magic..payload) */
+    {
+        size_t crc_len = (size_t)(w.p - ser_buf);
+        uint16_t crc = crc16_modbus_buf(ser_buf, crc_len);
+
+        /* append CRC (LE) */
+        if (wr_u16_le(&w, crc) < 0) { ser_len = 0; goto done; }
+    }
+
+    ser_len = (uint16_t)(w.p - ser_buf);
+#if PCA_DEBUG_LEVEL >= 1
+    dbg_print("[PCA] Serialized payload built: %d bytes (seq=%u payload_len=%u kept_n=%d)\r\n",
+              (int)ser_len, (unsigned)ser_seq-1, (unsigned)(ser_len - 4 - 1 - 2 - 2 - 2 /*approx header*/), kept_n_final);
+#endif
+
+done:
+
+    dbg_print("\r\n[PCA_SUMMARY] MSE=%.6f | TotVar=%.6f | Explained=%.2f%% | Samples=%d\r\n",
+              mse, tot_var, (tot_var>1e-9f) ? (100.0f*(1.0f - mse / tot_var)) : 0.0f, sample_count);
+    dbg_print("========================\r\n");
+
+    /* reset batch */
+    zero_buf();
+    last_run_ms = now_ms;
+    return 1;
+}
+
+/* accessor */
+void pca_prune_get_serialized_payload(const uint8_t **ptr, uint16_t *len)
+{
+    if (ptr) *ptr = ser_buf;
+    if (len) *len = ser_len;
+}
+
